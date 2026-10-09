@@ -1,0 +1,18 @@
+# ---- Not part of the game (never deploy/push these) ----
+
+# Node / OpenCode harness files (this package.json is NOT the game's)
+node_modules/
+package.json
+package-lock.json
+.npmrc
+
+# Leftover duplicate copy of the whole workspace (~596 MB)
+phyton level 02/
+
+# Editor settings
+.vscode/
+
+# ---- QA artifacts (kept on disk, but not pushed) ----
+review.html
+review-shots/
+joint-report.json

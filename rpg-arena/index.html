@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mini RPG Battle Arena</title>
+    <!-- Inline icon: keeps the console free of favicon.ico 404s (no extra file) -->
+    <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2016%2016'%3E%3Crect%20width='16'%20height='16'%20rx='3'%20fill='%23e74c3c'/%3E%3Ctext%20x='8'%20y='12'%20font-size='11'%20font-family='Arial'%20font-weight='bold'%20text-anchor='middle'%20fill='white'%3ER%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Press+Start+2P&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div id="game-container">
+        <!-- Background -->
+        <img src="assets/bg_arena.jpg" class="arena-bg" alt="Arena Background">
+        <!-- Arena lighting / atmosphere overlay -->
+        <div class="arena-lighting" aria-hidden="true"></div>
+
+        <!-- Round transition banner (ROUND 1 / NEXT OPPONENT / READY!) -->
+        <div id="round-banner" class="round-banner hidden" aria-live="polite"></div>
+
+        <!-- Top HUD (Heads Up Display) -->
+        <div id="hud">
+            <!-- Player Health -->
+            <div class="hud-side left-side">
+                <div class="name-plate">
+                    <img src="assets/hero.jpg" class="portrait" alt="Hero portrait">
+                    <span id="hero-name">Ryko</span>
+                    <span class="level-badge" id="hero-level">Lv. 1</span>
+                </div>
+                <div class="bar-container health-bar-container">
+                    <div id="hero-health" class="bar health-bar"></div>
+                    <span class="bar-value" id="hero-health-value">220/220</span>
+                </div>
+                <div class="bar-container mana-bar-container">
+                    <div id="hero-mana" class="bar mana-bar"></div>
+                    <span class="bar-value" id="hero-mana-value">60/60</span>
+                </div>
+                <div class="bar-container stamina-bar-container">
+                    <div id="hero-stamina" class="bar stamina-bar"></div>
+                    <span class="bar-value" id="hero-stamina-value">100/100</span>
+                </div>
+            </div>
+
+            <!-- Timer / Center -->
+            <div class="hud-center">
+                <div id="timer">FIGHT!</div>
+                <div id="turn-indicator" class="hidden">YOUR TURN</div>
+                <div id="combo-display" class="hidden"></div>
+            </div>
+
+            <!-- Enemy Health -->
+            <div class="hud-side right-side">
+                <div class="name-plate">
+                    <span class="level-badge" id="monster-level">Lv. 1</span>
+                    <span id="monster-name">Thug</span>
+                    <img src="assets/goblin.jpg" class="portrait" id="monster-portrait" alt="Enemy portrait">
+                </div>
+                <div class="bar-container health-bar-container right-bar">
+                    <div id="monster-health" class="bar health-bar"></div>
+                    <span class="bar-value" id="monster-health-value">100/100</span>
+                </div>
+                <div class="bar-container stamina-bar-container right-bar">
+                    <div id="monster-stamina" class="bar stamina-bar"></div>
+                    <span class="bar-value" id="monster-stamina-value">100/100</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 3D Fighters Layer -->
+        <div id="fighters-layer">
+            <canvas id="hero-canvas" class="fighter hero-fighter"></canvas>
+            <canvas id="monster-canvas" class="fighter monster-fighter"></canvas>
+            <!-- Particle FX layer (sparks / dust bursts) -->
+            <canvas id="fx-canvas" aria-hidden="true"></canvas>
+            <!-- Damage numbers layer -->
+            <div id="damage-numbers" class="damage-numbers-layer"></div>
+        </div>
+
+        <!-- Start / Game Over / Victory Overlay -->
+        <div id="overlay">
+            <div class="overlay-content">
+                <h1 id="overlay-message">BATTLE ARENA</h1>
+                <p id="overlay-sub">Defeat all three enemies to claim victory. Use combos, blocks and dodges wisely.</p>
+                <div id="victory-stats" class="hidden">
+                    <div class="stat-row"><span>Rounds:</span> <span id="stat-rounds">0</span></div>
+                    <div class="stat-row"><span>Damage Dealt:</span> <span id="stat-damage">0</span></div>
+                    <div class="stat-row"><span>Critical Hits:</span> <span id="stat-crits">0</span></div>
+                    <div class="stat-row"><span>Enemies Defeated:</span> <span id="stat-enemies">0</span></div>
+                </div>
+                <button id="restart-btn" class="action-btn">ENTER ARENA</button>
+            </div>
+        </div>
+
+        <!-- Controls Panel -->
+        <div id="controls">
+            <div class="control-row" id="attack-controls">
+                <button id="jab-btn" data-move="jab" class="action-btn punch-btn" title="Jab — fast and reliable. 5 stamina. (Key: 1)">👊 JAB <small>[1]</small></button>
+                <button id="punch-btn" data-move="punch" class="action-btn punch-btn" title="Straight Punch — balanced damage. 8 stamina. (Key: 2)">✊ PUNCH <small>[2]</small></button>
+                <button id="heavy-punch-btn" data-move="heavyPunch" class="action-btn heavy-btn" title="Heavy Punch — high damage, slower. 15 stamina. (Key: 3)">💪 HEAVY <small>[3]</small></button>
+                <button id="uppercut-btn" data-move="uppercut" class="action-btn heavy-btn" title="Uppercut — huge damage, beats crouchers. 18 stamina. (Key: 4)">⬆️ UPPERCUT <small>[4]</small></button>
+            </div>
+            <div class="control-row" id="kick-controls">
+                <button id="front-kick-btn" data-move="frontKick" class="action-btn kick-btn" title="Front Kick — quick mid kick. 12 stamina. (Key: 5)">🦵 FRONT KICK <small>[5]</small></button>
+                <button id="low-kick-btn" data-move="lowKick" class="action-btn kick-btn" title="Low Kick — trips crouchers. 10 stamina. (Key: 6)">🦵 LOW KICK <small>[6]</small></button>
+                <button id="roundhouse-btn" data-move="roundhouse" class="action-btn heavy-btn" title="Roundhouse — spinning high damage. 22 stamina. (Key: 7)">🌪️ ROUNDHOUSE <small>[7]</small></button>
+                <button id="heavy-kick-btn" data-move="heavyKick" class="action-btn heavy-btn" title="Heavy Kick — maximum damage, slower. 26 stamina. (Key: 8)">💥 HEAVY KICK <small>[8]</small></button>
+            </div>
+            <div class="control-row" id="defense-controls">
+                <button id="block-btn" data-move="block" class="action-btn defend-btn" title="Block — reduces incoming damage by 65%. 5 stamina. (Key: Q)">🛡️ BLOCK <small>[Q]</small></button>
+                <button id="dodge-btn" data-move="dodge" class="action-btn defend-btn" title="Dodge — 60% chance to avoid the attack completely. 12 stamina. (Key: E)">💨 DODGE <small>[E]</small></button>
+                <button id="crouch-btn" data-move="crouch" class="action-btn defend-btn" title="Crouch — evades high attacks, punished by low kicks. 8 stamina. (Key: C)">🔻 CROUCH <small>[C]</small></button>
+            </div>
+            <div class="control-row" id="special-controls">
+                <button id="heal-btn" data-move="heal" class="action-btn heal-btn" title="Heal — restore 40 HP, costs 20 mana. (Key: H)">❤️ HEAL <small>[H]</small></button>
+                <button id="special-btn" data-move="special" class="action-btn special-btn" title="Ultimate Special — devastating damage, costs 40 mana + 25 stamina. (Key: R)">⚡ SPECIAL <small>[R]</small></button>
+            </div>
+        </div>
+
+        <!-- Combat Log -->
+        <div id="combat-log">
+            <h3>Combat Log</h3>
+            <ul id="log-list"></ul>
+        </div>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>
