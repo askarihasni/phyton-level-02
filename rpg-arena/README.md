@@ -97,6 +97,19 @@ fighter to `K.O.` the other wins; the result screen offers **REMATCH** (and the
 legend's **MENU** button returns to single-player). The idle footwork of the two
 fighters stays mirrored and out of phase, and pauses during any action.
 
+Each fighter owns its **own** movement, facing, attack, block, dodge, crouch,
+cooldown and stamina state. The keyboard is resolved by a single dispatcher with
+two disjoint key maps, so a key can only ever drive one fighter: `A` moves only
+P1, `J` only P2, `D` only P1, `L` only P2, `Z` attacks only P1, `B` only P2.
+Held keys are polled per frame; attacks/jumps/dodges are edge-triggered; browser
+key-repeat is suppressed; and losing window focus releases every held key so no
+fighter gets stuck. There is no turn order and no global hit-stop in this mode.
+
+> **Debug the key routing:** add `?vsdebug=1` to the URL (or call
+> `game.versus.setDebug(true)` in the console) to show a small overlay reporting
+> the last key, the player it was assigned to, the action dispatched, and which
+> fighter changed state. It is off by default and registers no listeners itself.
+
 ---
 
 ## Gameplay
@@ -133,6 +146,7 @@ cd ..
 node test-logic.js                 # core classes / moves / AI logic
 node test-wiring.js                # HTML ids, data-move keys, assets, CSS classes
 node test-versus.js                # 2-player versus engine (pure logic, mock sprites)
+node test-versus-input.js          # 2-player input: per-key isolation + ownership
 node test-flow.js                  # full gauntlet flow (virtual clock)
 $env:SEED=56; node test-flow.js    # deterministic victory run (47 checks)
 node test-flow.js                  # default seed -> defeat run (44 checks)
@@ -145,6 +159,7 @@ Expected baseline:
 | `test-logic.js` | 56 / 56 |
 | `test-wiring.js` | 10 / 10 |
 | `test-versus.js` | 122 / 122 |
+| `test-versus-input.js` | 163 / 163 |
 | `test-flow.js` (SEED=56) | 47 / 47 |
 | `test-flow.js` (default seed) | 44 / 44 |
 

@@ -103,7 +103,8 @@ const UI = {
     versus: {
         btn: document.getElementById('versus-btn'),
         panel: document.getElementById('versus-controls'),
-        exit: document.getElementById('versus-exit')
+        exit: document.getElementById('versus-exit'),
+        debug: document.getElementById('vs-debug')
     },
     log: { list: document.getElementById('log-list') },
     overlay: {
@@ -1876,7 +1877,11 @@ class GameController {
             });
         }
 
-        // Keyboard shortcuts (numbers for strikes, letters for specials).
+        // -------- Single keyboard dispatcher ------------------------------
+        // Exactly ONE keydown/keyup pair for the whole app. It routes to the
+        // active mode: the single-player move map, or the versus arena's two
+        // disjoint per-fighter maps. Registered once, in the constructor, so
+        // restarting a match can never duplicate listeners.
         const KEY_MAP = {
             '1': 'jab', '2': 'punch', '3': 'heavyPunch', '4': 'uppercut',
             '5': 'frontKick', '6': 'lowKick', '7': 'roundhouse', '8': 'heavyKick',
@@ -1884,18 +1889,47 @@ class GameController {
             // legacy keys from the original build
             'a': 'punch', 's': 'roundhouse', 'd': 'heal'
         };
-        document.addEventListener('keydown', (e) => {
-            if (this.mode !== 'single') return;       // versus owns the keyboard
-            if (e.repeat) return;
-            if (!UI.overlay.container.classList.contains('hidden')) return;
-            if (e.target && /input|textarea/i.test(e.target.tagName)) return;
-            const key = e.key.toLowerCase();
-            const moveKey = KEY_MAP[key];
-            if (moveKey) {
-                e.preventDefault();
-                this.handleAction(moveKey);
-            }
-        });
+        document.addEventListener('keydown', (e) => this._handleKeyDown(e, KEY_MAP));
+        document.addEventListener('keyup', (e) => this._handleKeyUp(e));
+        window.addEventListener('blur', () => this._handleBlur());
+        document.addEventListener('visibilitychange', () => { if (document.hidden) this._handleBlur(); });
+        window.addEventListener('resize', () => { if (this.versus) this.versus.layout(); });
+    }
+
+    // Fields where typing must never drive a fighter.
+    _isEditable(el) {
+        if (!el) return false;
+        const tag = (el.tagName || '').toLowerCase();
+        return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable === true;
+    }
+
+    // Route one keydown to the active mode. Only keys the game handles are
+    // preventDefault-ed, so normal typing/scrolling is untouched.
+    _handleKeyDown(e, keyMap) {
+        if (this._isEditable(e.target)) return;
+        if (this.mode === 'versus' && this.versus) {
+            if (this.versus.handleKeyDown(e)) e.preventDefault();
+            return;
+        }
+        if (this.mode !== 'single') return;
+        if (e.repeat) return;
+        if (!UI.overlay.container.classList.contains('hidden')) return;
+        const key = (e.key || '').toLowerCase();
+        const moveKey = keyMap[key];
+        if (moveKey) {
+            e.preventDefault();
+            this.handleAction(moveKey);
+        }
+    }
+
+    // Only versus has release-triggered behaviour (held movement/block/crouch).
+    _handleKeyUp(e) {
+        if (this.mode === 'versus' && this.versus) this.versus.handleKeyUp(e);
+    }
+
+    // Focus lost => drop every held key so neither fighter can get stuck.
+    _handleBlur() {
+        if (this.versus) this.versus.clearKeys();
     }
 
     /* --------------------- versus mode control ----------------------- */
@@ -2406,6 +2440,15 @@ const VERSUS_KEYS = {
 };
 const VS_EDGE_ACTIONS = new Set(['jump', 'dodge', 'punch', 'kick', 'heavy', 'special']);
 
+// Resolve a normalized key to exactly one { player, action } owner. The two
+// maps are disjoint, so a key can never be claimed by both fighters. Pure =>
+// directly unit-testable, and the single source of truth for 2P routing.
+function versusKeyOwner(key) {
+    if (VERSUS_KEYS.p1[key]) return { player: 1, action: VERSUS_KEYS.p1[key] };
+    if (VERSUS_KEYS.p2[key]) return { player: 2, action: VERSUS_KEYS.p2[key] };
+    return null;
+}
+
 const vsClamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 // Stateless strike-pose evaluator: mirrors AnimationSystem.playStrike's
@@ -2654,8 +2697,9 @@ class VersusFighter {
             const spd = VS.WALK_SPEED * (airborne ? VS.AIR_CONTROL : 1);
             this.forward += dir * this.dirSign * spd * dt;
             this.walkPhase += dt * 11;
-            if (!airborne) this.state = 'walk';
-            this.setBusy(false);
+            // Only resume the idle stance on the ground; mid-air the jump pose
+            // stays paused so the body does not double-bob while airborne.
+            if (!airborne) { this.state = 'walk'; this.setBusy(false); }
         } else if (!airborne && this.state === 'walk') {
             this.state = 'idle';
         }
@@ -2772,12 +2816,15 @@ class VersusArena {
         this.container = UI.gameContainer;
         this.running = false; this.over = false; this.active = false;
         this.elapsed = 0; this._lastSec = -1; this._raf = 0;
+        this._runId = 0;                          // invalidates stale async starts
         this.keys = new Set();
-        this._kb = (e) => this._onKeyDown(e);
-        this._ku = (e) => this._onKeyUp(e);
-        this._blur = () => this.clearKeys();
-        this._vis = () => { if (document.hidden) this.clearKeys(); };
-        this._resize = () => this.layout();
+        // Optional on-screen input trace. Off by default; enabled with ?vsdebug
+        // or game.versus.setDebug(true). It never registers any listeners itself.
+        this.debugEl = (UI.versus && UI.versus.debug) || null;
+        this.debug = typeof location !== 'undefined' && /[?&]vsdebug(?:=|&|$)/.test(location.search || '');
+        if (this.debugEl) this.debugEl.classList.toggle('hidden', !this.debug);
+        this.lastAction = '';
+        this._changed = null;
     }
 
     layout() {
@@ -2798,21 +2845,17 @@ class VersusArena {
         this.running = true; this.over = false; this.active = false;
         this.elapsed = 0; this._lastSec = -1;
         this.keys = new Set();
+        const runId = ++this._runId;              // this start's identity
         this.p1 = new VersusFighter({ player: 1, name: 'PLAYER 1', char: new Character('Player 1', 220, 20), sprite: this.sprites.hero, arena: this });
         this.p2 = new VersusFighter({ player: 2, name: 'PLAYER 2', char: new Character('Player 2', 220, 20), sprite: this.sprites.monster, arena: this });
         this.p1.reset(); this.p2.reset();
         this.layout();
         applyFighterFilter(this.sprites.hero.canvas, 0, '', [this.sprites.hero.rig.head, this.sprites.hero.rig.arm]);
         applyFighterFilter(this.sprites.monster.canvas, 190, '', [this.sprites.monster.rig.head, this.sprites.monster.rig.arm]);
-        window.addEventListener('resize', this._resize);
-        document.addEventListener('keydown', this._kb);
-        document.addEventListener('keyup', this._ku);
-        window.addEventListener('blur', this._blur);
-        document.addEventListener('visibilitychange', this._vis);
         this._updateHUD(true, 0);
         this.p1.render(); this.p2.render();
         await sleep(650);
-        if (!this.running) return;
+        if (!this.running || runId !== this._runId) return;   // superseded by a newer start
         this.ui.showBanner('FIGHT!', 'round');
         this.active = true;
         this.lastTime = performance.now();
@@ -2842,6 +2885,7 @@ class VersusArena {
         if (hit1) { this.p1.attack.impactPending = false; this.resolveStrike(this.p1, this.p2, hit1); }
         if (hit2) { this.p2.attack.impactPending = false; this.resolveStrike(this.p2, this.p1, hit2); }
         this.p1.render(); this.p2.render();
+        if (this.debug) this._renderDebug();
         this._checkKO();
         this._updateHUD(false, dt);
     }
@@ -2967,33 +3011,35 @@ class VersusArena {
     }
 
     /* --------------------------- input ----------------------------- */
-    _mapFor(key) {
-        if (VERSUS_KEYS.p1[key]) return { player: 1, action: VERSUS_KEYS.p1[key] };
-        if (VERSUS_KEYS.p2[key]) return { player: 2, action: VERSUS_KEYS.p2[key] };
-        return null;
-    }
+    // Resolve a physical key to exactly one owner (never both). Delegates to
+    // the pure, unit-tested versusKeyOwner().
+    _mapFor(key) { return versusKeyOwner(key); }
 
-    _onKeyDown(e) {
-        if (!this.running) return;
-        if (e.repeat) return;
-        if (e.target && /input|textarea/i.test(e.target.tagName)) return;
+    // Consume one keydown. Returns true when the game handled the key so the
+    // single GameController dispatcher may preventDefault. No listeners are
+    // registered here — the controller owns the keyboard entirely.
+    handleKeyDown(e) {
+        if (!this.running) return false;
         const key = (e.key || '').toLowerCase();
         const map = this._mapFor(key);
-        if (!map) return;
-        e.preventDefault();
+        if (!map) return false;
+        if (e.repeat) return true;                 // mapped key held: consume (stops page scroll), no re-trigger
         const token = key + '|' + map.player;
-        if (this.keys.has(token)) return;         // suppress key-repeat storms
+        if (this.keys.has(token)) return true;     // held key: consume repeat storms
         this.keys.add(token);
         const f = map.player === 1 ? this.p1 : this.p2;
-        if (!f) return;
+        if (!f) return true;
         if (map.action === 'left') f.input.left = true;
         else if (map.action === 'right') f.input.right = true;
         else if (map.action === 'crouch') f.input.crouch = true;
         else if (map.action === 'block') f.input.block = true;
         if (VS_EDGE_ACTIONS.has(map.action)) f.onAction(map.action);
+        this._trace(key, map.player, map.action, f);
+        return true;
     }
 
-    _onKeyUp(e) {
+    // Release only the owner's held action; the other fighter is untouched.
+    handleKeyUp(e) {
         const key = (e.key || '').toLowerCase();
         const map = this._mapFor(key);
         if (!map) return;
@@ -3004,6 +3050,29 @@ class VersusArena {
         else if (map.action === 'right') f.input.right = false;
         else if (map.action === 'crouch') f.input.crouch = false;
         else if (map.action === 'block') f.input.block = false;
+        this._trace(key, map.player, map.action + ' (release)', f);
+    }
+
+    // Optional visible input trace: key -> owner -> action -> whose state moved.
+    setDebug(on) {
+        this.debug = !!on;
+        if (this.debugEl) this.debugEl.classList.toggle('hidden', !this.debug);
+        this._renderDebug();
+    }
+
+    _trace(key, player, action, f) {
+        this.lastAction = `key '${key}' -> P${player} : ${action}`;
+        this._changed = f;
+        this._renderDebug();
+    }
+
+    _renderDebug() {
+        if (!this.debug || !this.debugEl) return;
+        const st = (f) => f ? `${f.name}: ${f.state}${f.attack ? ' [' + f.attack.action + ']' : ''}` : '-';
+        this.debugEl.textContent =
+            `${this.lastAction || 'waiting for input'}\n` +
+            `changed: ${this._changed ? this._changed.name : '-'}\n` +
+            `${st(this.p1)}\n${st(this.p2)}`;
     }
 
     clearKeys() {
@@ -3011,16 +3080,13 @@ class VersusArena {
         for (const f of [this.p1, this.p2]) {
             if (f) f.input = { left: false, right: false, crouch: false, block: false };
         }
+        if (this.debug) this._renderDebug();
     }
 
     stop() {
         this.running = false; this.active = false;
+        this._runId++;                            // cancel any pending start()
         if (this._raf) { cancelAnimationFrame(this._raf); this._raf = 0; }
-        document.removeEventListener('keydown', this._kb);
-        document.removeEventListener('keyup', this._ku);
-        window.removeEventListener('blur', this._blur);
-        document.removeEventListener('visibilitychange', this._vis);
-        window.removeEventListener('resize', this._resize);
         if (this.keys) this.clearKeys();
     }
 }
