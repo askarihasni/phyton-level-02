@@ -5,6 +5,10 @@ best-of gauntlet against three AI-controlled monsters, using a data-driven set
 of 13 moves with stamina/mana costs, combos, criticals, blocks, dodges,
 crouches and a mana-fuelled ultimate.
 
+It also ships a **local 2-player versus mode**: two people share one keyboard
+and fight in real time (no turn waiting, no freeze), each with independent
+movement, attacks, health and stamina.
+
 Everything is plain HTML, CSS and JavaScript. There is **no build step and no
 external JavaScript dependency**. The only network request is the optional
 Google Fonts stylesheet; if it is blocked the UI falls back to the system font
@@ -27,6 +31,13 @@ Then open **http://localhost:8000/** in a browser.
 You can also just double-click `index.html` (it works from `file://`), but a
 local server is recommended so font loading and background images behave
 exactly as in production.
+
+> **Use a local server for full visuals.** Browsers block JavaScript from reading
+> the pixels of `file://` images (a security rule), which is required to remove
+> the green screen behind the fighter art. Served over `http://`, sprites are
+> keyed perfectly. Opened directly from `file://` the game still runs, but the
+> fighters keep their green backing and the articulated head/arm rig is
+> disabled. This is a browser restriction, not a bug.
 
 > The repository root also contains a tiny `index.html` that redirects to
 > `rpg-arena/index.html` if you serve from the parent folder instead.
@@ -54,6 +65,37 @@ Click the on-screen buttons, or use the keyboard shortcuts:
 | `R` | Special (Ultimate) | 40 mana + 25 stamina | Devastating |
 
 Legacy keys `A` (punch), `S` (roundhouse) and `D` (heal) also work.
+
+---
+
+## 2-Player Versus (local, same keyboard)
+
+Click **2 PLAYERS** on the start (or result) screen. It is a separate mode —
+single-player is untouched. Both fighters act at the same time and there is no
+turn order: hold movement keys freely, attack while your opponent moves, and
+trade blows simultaneously. Each player has their own health and stamina bar.
+
+| Action | Player 1 | Player 2 |
+|--------|----------|----------|
+| Jump | `W` | `I` |
+| Left | `A` | `J` |
+| Crouch | `S` | `K` |
+| Right | `D` | `L` |
+| Block | `Q` | `U` |
+| Dodge | `E` | `O` |
+| Punch | `Z` | `B` |
+| Kick | `X` | `N` |
+| Heavy | `C` | `M` |
+| Special | `V` | `P` |
+| (optional jump) | `Space` | — |
+
+Movement is screen-direction intuitive: for both players the "left" key moves
+on screen to the left and "right" to the right. The fighters always face each
+other and may not fully overlap. Damage resolves once per strike at the contact
+frame, blocks reduce damage, and a well-timed dodge grants brief i-frames. First
+fighter to `K.O.` the other wins; the result screen offers **REMATCH** (and the
+legend's **MENU** button returns to single-player). The idle footwork of the two
+fighters stays mirrored and out of phase, and pauses during any action.
 
 ---
 
@@ -90,6 +132,7 @@ run from there:
 cd ..
 node test-logic.js                 # core classes / moves / AI logic
 node test-wiring.js                # HTML ids, data-move keys, assets, CSS classes
+node test-versus.js                # 2-player versus engine (pure logic, mock sprites)
 node test-flow.js                  # full gauntlet flow (virtual clock)
 $env:SEED=56; node test-flow.js    # deterministic victory run (47 checks)
 node test-flow.js                  # default seed -> defeat run (44 checks)
@@ -101,6 +144,7 @@ Expected baseline:
 |-------|--------|
 | `test-logic.js` | 56 / 56 |
 | `test-wiring.js` | 10 / 10 |
+| `test-versus.js` | 122 / 122 |
 | `test-flow.js` (SEED=56) | 47 / 47 |
 | `test-flow.js` (default seed) | 44 / 44 |
 

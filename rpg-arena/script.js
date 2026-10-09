@@ -100,6 +100,11 @@ const UI = {
         special: document.getElementById('special-btn'),
         panel: document.getElementById('controls')
     },
+    versus: {
+        btn: document.getElementById('versus-btn'),
+        panel: document.getElementById('versus-controls'),
+        exit: document.getElementById('versus-exit')
+    },
     log: { list: document.getElementById('log-list') },
     overlay: {
         container: document.getElementById('overlay'),
@@ -190,9 +195,9 @@ const SoundFX = {
     enrage()  { this.tone(110, 0.5, 'sawtooth', 0.24, 55); },
     victory() { [523, 659, 784, 1046].forEach((f, i) => setTimeout(() => this.tone(f, 0.22, 'triangle', 0.16), i * 130)); },
     defeat()  { [400, 320, 240, 160].forEach((f, i) => setTimeout(() => this.tone(f, 0.3, 'sawtooth', 0.14), i * 170)); },
+    jump()    { this.tone(300, 0.12, 'triangle', 0.10, 620); },
     ko()      { this.tone(200, 0.6, 'square', 0.2, 45); }
 };
-
 /* ========================= SPRITE PIPELINE ============================== */
 // (Preserved from original: green-screen removal + cached keyed frames.)
 const FIGHTER_FRAMES = {
@@ -216,15 +221,23 @@ function loadKeyedSprite(imgSrc) {
             canvas.height = SPRITE_WIDTH * ratio;
             const ctx = canvas.getContext('2d', { willReadFrequently: true });
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-            const l = frame.data.length / 4;
-            for (let i = 0; i < l; i++) {
-                const r = frame.data[i * 4 + 0];
-                const g = frame.data[i * 4 + 1];
-                const b = frame.data[i * 4 + 2];
-                if (g > 150 && g > r * 1.5 && g > b * 1.5) frame.data[i * 4 + 3] = 0;
+            try {
+                const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const l = frame.data.length / 4;
+                for (let i = 0; i < l; i++) {
+                    const r = frame.data[i * 4 + 0];
+                    const g = frame.data[i * 4 + 1];
+                    const b = frame.data[i * 4 + 2];
+                    if (g > 150 && g > r * 1.5 && g > b * 1.5) frame.data[i * 4 + 3] = 0;
+                }
+                ctx.putImageData(frame, 0, 0);
+            } catch (e) {
+                // Tainted canvas — browsers block pixel reads on file:// pages
+                // (no --allow-file-access-from-files), so green-screen removal
+                // is impossible. Resolve the raw frame anyway so the game still
+                // boots and stays playable; serve over HTTP for full keying.
+                canvas.__unkeyed = true;
             }
-            ctx.putImageData(frame, 0, 0);
             resolve(canvas);
         };
     });
@@ -250,9 +263,24 @@ function applyFighterFilter(canvas, hueRotate = 0, extra = '', layers = []) {
 // Overlay transforms are baked into the canvas draw (rotate about the joint
 // pivot) — the DOM elements themselves mirror the fighter's inline pose.
 const RIG_PARTS = {
-    head: { clip: [186, 15, 62, 61], pivot: [215, 73] },   // face / helmet region
+    head: { clip: [186, 15, 62, 61], pivot: [216, 70] },   // face / helmet region
     arm:  { clip: [250, 66, 123, 93], pivot: [252, 80] }   // front arm span
 };
+// Head silhouette rig (Phase 6): the original head overlay rotated a hard
+// rectangle, so it dragged a slab of shoulder with it and left a rectangular
+// background hole behind — the "cut-out pasted on" look. The head is now cut
+// with its own alpha silhouette and the body hole is re-cut DYNAMICALLY to
+// exactly match the rotated overlay on every head move. Because the hole and
+// the overlay are the same footprint, the composite has no background gaps and
+// no doubled face at ANY tilt, and no torso pixel ever rotates.
+// HEAD_BOX is the head-only region above the shoulder line (measured from the
+// keyed art: head spans x≈185-243, y≈18-69; shoulders start at y≈72); the
+// overlay is clipped to it, so the shoulders never move with the head.
+const HEAD_BOX = { x: 178, y: 10, w: 78, h: 60 };   // x178..255, y10..69
+// Region the body restores/carves while the head tilts (covers the rotated
+// head footprint with margin; restored from the arm-erased base so the arm
+// hole is never refilled).
+const HEAD_ERASE = { x0: 158, y0: 2, w: 114, h: 104 };
 // Arm polygon minus the body-kept shoulder/bridge zone: the keyed art's only
 // arm↔torso attachment is the bridge at y114-158 (x260-300) plus the punch
 // frame's shoulder strip (x250-260, y86-114). Keeping those pixels on the
@@ -314,6 +342,75 @@ class FighterSprite {
         this.shadow = shadowHost;
     }
 
+    // Pre-compute, per frame: (a) the arm-erased base body used to restore the
+    // head area without refilling the arm hole, and (b) the head overlay
+    // sprite — an alpha silhouette clipped to HEAD_BOX, grown 1px to cover
+    // anti-aliased fringes. Both derive from the SAME keyed frame, which is
+    // what lets the dynamic re-cut below be seamless at every angle.
+    _buildHeadRigs() {
+        this.headSprites = {};
+        this.baseBody = {};
+        const { x: bx, y: by, w: bw, h: bh } = HEAD_BOX;
+        const W = this.canvas.width, H = this.canvas.height;
+        for (const name of Object.keys(this.frames)) {
+            const frame = this.frames[name];
+
+            // (a) base body: frame with the arm polygon erased (idle/punch only)
+            const base = document.createElement('canvas');
+            base.width = W; base.height = H;
+            const bctx = base.getContext('2d', { willReadFrequently: true });
+            try { bctx.drawImage(frame, 0, 0, W, H); } catch (e) { /* shim */ }
+            if (RIG_ERASED.has(name)) {
+                let bd = null;
+                try { bd = bctx.getImageData(0, 0, W, H); } catch (e) { bd = null; }
+                if (bd) {
+                    const d = bd.data;
+                    for (let y = 66; y <= 158; y++) {
+                        for (let x = 250; x <= 372; x++) {
+                            if (pointInPoly(x, y, RIG_POLY)) d[(y * W + x) * 4 + 3] = 0;
+                        }
+                    }
+                    try { bctx.putImageData(bd, 0, 0); } catch (e) { /* shim */ }
+                }
+            }
+            this.baseBody[name] = base;
+
+            if (!RIG_ERASED.has(name)) { this.headSprites[name] = null; continue; }
+
+            // (b) head overlay: frame pixels within the silhouette (1px grown)
+            let fd = null;
+            try { fd = frame.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H); }
+            catch (e) { fd = null; }
+            if (!fd) { this.headSprites[name] = null; continue; }
+            const alphaAt = (x, y) => (x < 0 || y < 0 || x >= W || y >= H) ? 0 : fd.data[(y * W + x) * 4 + 3];
+            const inMask = (x, y) => (x < bx || y < by || x >= bx + bw || y >= by + bh) ? false : alphaAt(x, y) > 40;
+            const anyAround = (x, y, r) => {
+                for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+                    if (dx * dx + dy * dy > r * r) continue;
+                    if (inMask(x + dx, y + dy)) return true;
+                }
+                return false;
+            };
+            const head = document.createElement('canvas');
+            head.width = W; head.height = H;
+            const hctx = head.getContext('2d', { willReadFrequently: true });
+            try { hctx.drawImage(frame, 0, 0, W, H); } catch (e) { /* shim */ }
+            let hd = null;
+            try { hd = hctx.getImageData(0, 0, W, H); } catch (e) { hd = null; }
+            if (hd) {
+                const d = hd.data;
+                for (let y = by - 1; y < by + bh + 1; y++) {
+                    for (let x = bx - 1; x < bx + bw + 1; x++) {
+                        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+                        if (!anyAround(x, y, 1)) d[(y * W + x) * 4 + 3] = 0;
+                    }
+                }
+                try { hctx.putImageData(hd, 0, 0); } catch (e) { /* shim */ }
+            }
+            this.headSprites[name] = head;
+        }
+    }
+
     // Trace one overlay part with the arm's exact polygon so rotating it never
     // drags torso pixels (the arm clip rect is wider than the limb itself).
     _tracePolygon(ctx) {
@@ -324,37 +421,46 @@ class FighterSprite {
         ctx.clip();
     }
 
-    // Punch a transparent hole where an overlay layer will sit so the rigged
-    // head/arm are the ONLY source of those pixels. Applied to THIS canvas on
-    // every grounded draw — the shared keyed frames stay pristine for the
-    // overlay layers to cut from.
-    _eraseRiggedRegions() {
+    // Restore the body under the head from the arm-erased base. Clearing then
+    // redrawing the base region guarantees the head area is pristine (so it can
+    // be re-carved at a new angle) without ever refilling the arm hole.
+    _restoreBodyHead(name) {
+        const R = HEAD_ERASE;
+        this.ctx.clearRect(R.x0, R.y0, R.w, R.h);
+        const base = (this.baseBody && this.baseBody[name]) || this.frames[name];
+        this.ctx.drawImage(base, R.x0, R.y0, R.w, R.h, R.x0, R.y0, R.w, R.h);
+    }
+
+    // Carve the body exactly where the CURRENT (rotated) head overlay will sit.
+    // The overlay is rendered into a scratch canvas with the same transform, and
+    // every body pixel it covers is cleared — so the composite is seamless (the
+    // body can never show through a rotated face) and never doubled.
+    _eraseHeadFootprint(name, deg, off) {
+        const sprite = this.headSprites && this.headSprites[name];
+        if (!sprite) return;
+        const W = this.canvas.width, H = this.canvas.height;
+        const s = this._headScratch || (this._headScratch = document.createElement('canvas'));
+        s.width = W; s.height = H;
+        const sc = s.getContext('2d', { willReadFrequently: true });
+        sc.clearRect(0, 0, W, H);
+        const pivot = RIG_PARTS.head.pivot;
+        sc.save();
+        sc.translate(pivot[0] + off.x, pivot[1] + off.y);
+        sc.rotate(deg * Math.PI / 180);
+        sc.translate(-pivot[0], -pivot[1]);
+        sc.drawImage(sprite, 0, 0);
+        sc.restore();
+        const R = HEAD_ERASE;
+        let sd = null, bd = null;
         try {
-            // The airborne kick frame is composed on its own (layers hidden) —
-            // never carve holes into it.
-            if (this.currentFrame === 'kick') return;
-            const img = this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height);
-            const d = img.data, w = this.canvas.width;
-            const clear = (x0, y0, x1, y1) => {
-                for (let y = y0; y <= y1; y++) {
-                    for (let x = x0; x <= x1; x++) d[(y * w + x) * 4 + 3] = 0;
-                }
-            };
-            // arm polygon (idle/punch frames — the kick frame is its own body)
-            if (RIG_ERASED.has(this.currentFrame)) {
-                for (let y = 66; y <= 158; y++) {
-                    for (let x = 250; x <= 372; x++) {
-                        if (pointInPoly(x, y, RIG_POLY)) d[(y * w + x) * 4 + 3] = 0;
-                    }
-                }
-            }
-            // head clip rect — the rigged head layer is its only visible source
-            // Inclusive bounds must match the head layer's drawImage coverage
-            // (clip rect w/h), or a 1px seam of lost art appears at rest.
-            const h = RIG_PARTS.head.clip;
-            clear(h[0], h[1], h[0] + h[2] - 1, h[1] + h[3] - 1);
-            this.ctx.putImageData(img, 0, 0);
-        } catch (e) { /* rig erasure is cosmetic — never fatal */ }
+            sd = sc.getImageData(R.x0, R.y0, R.w, R.h);
+            bd = this.ctx.getImageData(R.x0, R.y0, R.w, R.h);
+        } catch (e) { return; }
+        const sdd = sd.data, bdd = bd.data;
+        for (let i = 3; i < bdd.length; i += 4) {
+            if (sdd[i] > 8) bdd[i] = 0;
+        }
+        try { this.ctx.putImageData(bd, R.x0, R.y0); } catch (e) { /* shim */ }
     }
 
     async load(frameSrcs) {
@@ -365,6 +471,7 @@ class FighterSprite {
         this.canvas.width = this.frames.idle.width;
         this.canvas.height = this.frames.idle.height;
         this.currentFrame = null;
+        this._buildHeadRigs();
         this.setFrame('idle');
         this.resetPose();
         this.loaded = true;
@@ -373,9 +480,9 @@ class FighterSprite {
     setFrame(name) {
         if (this.currentFrame === name || !this.frames[name]) return;
         this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
-        this.ctx.drawImage(this.frames[name], 0, 0, this.canvas.width, this.canvas.height);
+        const base = (this.baseBody && this.baseBody[name]) || this.frames[name];
+        this.ctx.drawImage(base, 0, 0, this.canvas.width, this.canvas.height);
         this.currentFrame = name;
-        this._eraseRiggedRegions();
         for (const part of Object.keys(RIG_PARTS)) this._redrawPart(part, name);
     }
 
@@ -393,6 +500,18 @@ class FighterSprite {
         layer.classList.remove('hidden');
         const deg = this._partAngles[part] || 0;
         const off = this._partOffsets[part] || { x: 0, y: 0 };
+        // Head: restore the body area, re-cut the hole to match the current
+        // tilt, then draw the alpha-silhouette overlay about the neck pivot.
+        if (part === 'head' && this.headSprites && this.headSprites[name]) {
+            this._restoreBodyHead(name);
+            this._eraseHeadFootprint(name, deg, off);
+            ctx.translate(cfg.pivot[0] + off.x, cfg.pivot[1] + off.y);
+            ctx.rotate(deg * Math.PI / 180);
+            ctx.translate(-cfg.pivot[0], -cfg.pivot[1]);
+            ctx.drawImage(this.headSprites[name], 0, 0);
+            ctx.restore();
+            return;
+        }
         if (part === 'arm' && name === 'idle') {
             // Idle arm rests against a horizontal shoulder junction (y=114).
             // A rigid rotation about any single pivot would open a background
@@ -695,22 +814,22 @@ const ANIM_PROFILES = {
 // seq steps describe the out-and-back body sweep; x/r are signed so both a
 // hero and a (CSS-flipped) monster recoil away from the attacker.
 const REACTIONS = {
-    light: { knockX: 12, headDeg: -8, restX: 0, restR: 0, recoverMs: 140,
+    light: { knockX: 12, headDeg: -6, restX: 0, restR: 0, recoverMs: 140,
              seq: [
                  { ms: 90, x: t => -lerp(0, 14, t), y: t => 0, r: t => -lerp(0, 4, t) },
                  { ms: 100, x: t => -lerp(14, 1, t), y: t => 0, r: t => -lerp(4, 0, t) }
              ] },
-    low: { knockX: 8, headDeg: -10, restX: 0, restR: 0, recoverMs: 140,
+    low: { knockX: 8, headDeg: -7, restX: 0, restR: 0, recoverMs: 140,
            seq: [
                { ms: 80, x: t => -lerp(0, 10, t), y: t => lerp(0, 9, t), r: t => lerp(0, 3, t) },
                { ms: 90, x: t => -lerp(10, 0, t), y: t => lerp(9, 0, t), r: t => lerp(3, 0, t) }
            ] },
-    heavy: { knockX: 26, headDeg: -16, restX: 0, restR: 0, recoverMs: 190,
+    heavy: { knockX: 26, headDeg: -10, restX: 0, restR: 0, recoverMs: 190,
              seq: [
                  { ms: 110, x: t => -lerp(0, 42, Ease.outCubic(t)), y: t => -lerp(0, 12, t), r: t => -lerp(0, 10, t), sy: t => 1 - 0.08 * t },
                  { ms: 170, x: t => -lerp(42, 4, Ease.outQuad(t)), y: t => lerp(-12, 0, t), r: t => -lerp(10, 2, t), sy: t => 1 - 0.08 * (1 - t) }
              ] },
-    crit: { knockX: 34, headDeg: -22, restX: 0, restR: 0, recoverMs: 230,
+    crit: { knockX: 34, headDeg: -13, restX: 0, restR: 0, recoverMs: 230,
             seq: [
                 { ms: 120, x: t => -lerp(0, 58, Ease.outCubic(t)), y: t => -lerp(0, 18, t), r: t => -lerp(0, 14, t), sx: t => 1 + 0.1 * t, sy: t => 1 - 0.12 * t },
                 { ms: 210, x: t => -lerp(58, 6, Ease.outQuad(t)), y: t => lerp(-18, 0, t), r: t => -lerp(14, 3, t), sx: t => 1 + 0.1 * (1 - t), sy: t => 1 - 0.12 * (1 - t) }
@@ -1026,14 +1145,19 @@ class UIController {
             window.addEventListener('resize', () => this.syncDeckHeight());
         }
         // Fonts/wrapping can change the deck height after boot — watch it.
-        if (typeof ResizeObserver === 'function' && UI.controls.panel) {
+        if (typeof ResizeObserver === 'function') {
             this._deckRO = new ResizeObserver(() => this.syncDeckHeight());
-            this._deckRO.observe(UI.controls.panel);
+            if (UI.controls.panel) this._deckRO.observe(UI.controls.panel);
+            if (UI.versus && UI.versus.panel) this._deckRO.observe(UI.versus.panel);
         }
     }
 
     syncDeckHeight() {
-        const panel = UI.controls && UI.controls.panel;
+        // Measure whichever control deck is on screen (the versus legend shares
+        // the same bottom band and must anchor the fighters too).
+        const inVersus = UI.gameContainer && UI.gameContainer.classList
+            && UI.gameContainer.classList.contains('versus-mode');
+        const panel = (inVersus && UI.versus && UI.versus.panel) ? UI.versus.panel : (UI.controls && UI.controls.panel);
         if (!panel || typeof panel.getBoundingClientRect !== 'function') return;
         const h = panel.getBoundingClientRect().height;
         if (!(h > 0)) return;
@@ -1208,6 +1332,44 @@ class UIController {
     hideOverlay() {
         UI.overlay.container.classList.add('hidden');
         UI.controls.panel.classList.remove('overlay-open');
+    }
+
+    /* --------------------- versus (2-player) UI ----------------------- */
+    enterVersus() {
+        UI.gameContainer.classList.add('versus-mode');
+        if (UI.controls.panel) UI.controls.panel.classList.add('hidden');
+        if (UI.versus && UI.versus.panel) UI.versus.panel.classList.remove('hidden');
+        UI.hero.name.textContent = 'PLAYER 1';
+        UI.monster.name.textContent = 'PLAYER 2';
+        if (UI.monster.portrait) UI.monster.portrait.src = 'assets/fighter.jpg';
+        if (UI.hero.level) UI.hero.level.textContent = '';
+        if (UI.monster.level) UI.monster.level.textContent = '';
+        UI.turnIndicator.classList.add('hidden');
+        UI.combo.classList.add('hidden');
+        UI.hero.healthBar.classList.remove('low', 'critical');
+        UI.monster.healthBar.classList.remove('low', 'critical');
+        UI.hero.canvas.classList.remove('low-hp', 'ko-hero', 'hurt-state');
+        UI.monster.canvas.classList.remove('low-hp', 'ko-monster', 'hurt-state', 'enraged');
+        this.clearLog();
+        this.addLog('<b>2-PLAYER VERSUS</b> — first to K.O. the other wins. Everyone fights at once!', 'system-log');
+        this.syncDeckHeight();
+    }
+
+    exitVersus() {
+        UI.gameContainer.classList.remove('versus-mode');
+        if (UI.versus && UI.versus.panel) UI.versus.panel.classList.add('hidden');
+        if (UI.controls.panel) UI.controls.panel.classList.remove('hidden');
+        this.syncDeckHeight();
+    }
+
+    showVersusResult(winner) {
+        UI.overlay.container.classList.remove('hidden');
+        UI.overlay.message.textContent = winner === 1 ? 'PLAYER 1 WINS!' : 'PLAYER 2 WINS!';
+        UI.overlay.message.className = 'victory';
+        UI.overlay.sub.classList.add('hidden');
+        UI.overlay.stats.classList.add('hidden');
+        UI.overlay.restartBtn.textContent = 'REMATCH';
+        if (UI.controls.panel) UI.controls.panel.classList.remove('overlay-open');
     }
 }
 
@@ -1567,7 +1729,7 @@ class AnimationSystem {
             sprite.canvas.classList.add(cls);
             await tween(180, t => {
                 const e = Ease.outQuad(t);
-                sprite.setRigPart('head', { deg: 10, x: -8 });
+                sprite.setRigPart('head', { deg: 8, x: -5 });
                 sprite.setPose(lerp(0, -22, e), 0, 1, 1, lerp(0, 6, e));
             }, Ease.outQuad);
             await sleep(140);
@@ -1578,7 +1740,7 @@ class AnimationSystem {
             sprite.canvas.classList.add(cls);
             await tween(200, t => {
                 const e = Ease.outQuad(t);
-                sprite.setRigPart('head', { y: 10 });
+                sprite.setRigPart('head', { y: 4 });
                 sprite.setPose(0, lerp(0, 14, e), 1, lerp(1, 0.9, e));
             }, Ease.outQuad);
             await sleep(300);
@@ -1610,13 +1772,13 @@ class AnimationSystem {
             // 1) STAGGER: snap back, reeling
             await tween(140, t => {
                 const e = Ease.outCubic(t);
-                sprite.setRigPart('head', { deg: -18 });
+                sprite.setRigPart('head', { deg: -10 });
                 sprite.setPose(lerp(0, -26, e), lerp(0, -8, e), 1, 1, lerp(0, -14, e));
             }, Ease.outCubic);
             // 2) CRUMPLE: knees give out, body folds over
             await tween(430, t => {
                 const e = Ease.inCubic(t);
-                sprite.setRigPart('head', { deg: -34 });
+                sprite.setRigPart('head', { deg: -16 });
                 sprite.setPose(lerp(-26, 0, e), lerp(-8, 26, e), 1, 1 - 0.35 * e, lerp(-14, -72, e));
             }, Ease.inCubic);
             // 3) DUST + rest
@@ -1661,6 +1823,8 @@ class AnimationSystem {
 class GameController {
     constructor() {
         this.state = GameState.START;
+        this.mode = 'single';      // 'single' (turn-based) | 'versus' (2-player real-time)
+        this.versus = null;        // lazy VersusArena instance
         this.ui = new UIController();
         this.sprites = {
             hero: new FighterSprite(UI.hero.canvas, 'hero'),
@@ -1696,8 +1860,21 @@ class GameController {
         }
         UI.overlay.restartBtn.addEventListener('click', () => {
             SoundFX.click();
-            this.startGame();
+            this.restart();
         });
+        // Enter local 2-player versus from the menu / any result screen.
+        if (UI.versus && UI.versus.btn) {
+            UI.versus.btn.addEventListener('click', () => {
+                SoundFX.click();
+                this.startVersus();
+            });
+        }
+        if (UI.versus && UI.versus.exit) {
+            UI.versus.exit.addEventListener('click', () => {
+                SoundFX.click();
+                this.exitVersus();
+            });
+        }
 
         // Keyboard shortcuts (numbers for strikes, letters for specials).
         const KEY_MAP = {
@@ -1708,6 +1885,7 @@ class GameController {
             'a': 'punch', 's': 'roundhouse', 'd': 'heal'
         };
         document.addEventListener('keydown', (e) => {
+            if (this.mode !== 'single') return;       // versus owns the keyboard
             if (e.repeat) return;
             if (!UI.overlay.container.classList.contains('hidden')) return;
             if (e.target && /input|textarea/i.test(e.target.tagName)) return;
@@ -1720,10 +1898,64 @@ class GameController {
         });
     }
 
+    /* --------------------- versus mode control ----------------------- */
+    // Restart button: rematch the current mode.
+    restart() {
+        if (this.mode === 'versus') {
+            this.state = GameState.GAME_OVER;
+            this.startVersus();
+        } else {
+            this.startGame();
+        }
+    }
+
+    async startVersus() {
+        const okStates = [GameState.START, GameState.GAME_OVER, GameState.VICTORY, GameState.DEFEAT];
+        if (!okStates.includes(this.state)) return;
+        this.mode = 'versus';
+        this.state = GameState.ROUND_TRANSITION;
+        this.ui.hideOverlay();
+        this.ui.enterVersus();
+        await this._spritesReady;
+        if (this.mode !== 'versus') return;           // bailed out while loading
+        if (!this.versus) {
+            this.versus = new VersusArena({
+                ui: this.ui, sprites: this.sprites, fx: this.fx, anim: this.anim,
+                onEnd: (winner) => this._endVersus(winner)
+            });
+        }
+        this.versus.start();
+    }
+
+    _endVersus(winner) {
+        this.state = GameState.GAME_OVER;
+        this.ui.showVersusResult(winner);
+    }
+
+    exitVersus() {
+        if (this.versus) this.versus.stop();
+        this.mode = 'single';
+        this.state = GameState.START;
+        this.ui.exitVersus();
+        this.ui.setTimer('FIGHT!');
+        this.ui.showStartScreen();
+    }
+
+    _leaveVersus() {
+        if (this.versus) this.versus.stop();
+        if (this.mode === 'versus' || (UI.gameContainer.classList && UI.gameContainer.classList.contains('versus-mode'))) {
+            UI.gameContainer.classList.remove('versus-mode');
+            if (UI.versus && UI.versus.panel) UI.versus.panel.classList.add('hidden');
+            if (UI.controls.panel) UI.controls.panel.classList.remove('hidden');
+        }
+        this.mode = 'single';
+    }
+
     async startGame() {
         // Only valid from idle/end states — never restart mid-fight.
         const okStates = [GameState.START, GameState.GAME_OVER, GameState.VICTORY, GameState.DEFEAT];
         if (!okStates.includes(this.state)) return;
+        this._leaveVersus();          // single-player and versus are mutually exclusive
         const token = ++this.runToken;
         try {
             await this._runStart(token);
@@ -2128,6 +2360,668 @@ class GameController {
                 enemies: this.stats.enemies
             }
         });
+    }
+}
+
+/* ====================== TWO-PLAYER VERSUS MODE ========================= */
+// A self-contained real-time mode that runs ALONGSIDE the turn-based
+// single-player game (never replaces it). Both fighters are driven every
+// animation frame from a delta-time loop; input is polled (held keys) with
+// edge-triggered attacks, so there is no PLAYER_TURN/ENEMY_TURN waiting and
+// no global freeze. It reuses the existing sprite rig, move metadata,
+// CombatSystem and FX rather than rebuilding any of them.
+
+const VS = Object.freeze({
+    WALK_SPEED: 215,          // px/s forward/back
+    AIR_CONTROL: 0.82,
+    GRAVITY: 2200,            // px/s^2
+    JUMP_VY: 780,             // px/s upward
+    MAX_FORWARD: 265,
+    MIN_FORWARD: -175,
+    DODGE_MS: 380,
+    DODGE_IFRAME_MS: 240,
+    DODGE_COOLDOWN_MS: 700,
+    DODGE_COST: 12,
+    DODGE_BACK: 230,          // px/s slip-away during a dodge
+    ATTACK_COOLDOWN_MS: 110,
+    STAMINA_REGEN: 14,        // per second
+    MIN_GAP_FACTOR: 0.40,     // min centre gap = 40% of a fighter's width
+    MIN_GAP_PX: 150,
+    HURT_FLASH_MS: 180
+});
+
+// Moves are MOVES-shaped (rollAttack/resolveIncoming consume the same fields)
+// so the versus mode reuses the exact damage maths as single-player.
+const VS_ATTACKS = {
+    punch:   { kind: 'attack', label: 'Punch',   profile: 'punch',      frame: 'punch', range: 370, staminaCost: 5,  accuracy: 0.97, multiplier: 1.00, critChance: 0.10, hitLevel: 'mid',  sfx: ['POW!', 'WHAM!', 'SMACK!'], sound: 'punch' },
+    kick:    { kind: 'attack', label: 'Kick',    profile: 'frontKick',  frame: 'kick',  range: 420, staminaCost: 12, accuracy: 0.93, multiplier: 1.15, critChance: 0.10, hitLevel: 'mid',  sfx: ['THUD!', 'BAM!', 'WHUMP!'], sound: 'kick' },
+    heavy:   { kind: 'attack', label: 'Heavy',   profile: 'heavyPunch', frame: 'punch', range: 395, staminaCost: 15, accuracy: 0.88, multiplier: 1.60, critChance: 0.12, hitLevel: 'mid',  sfx: ['KRAK!', 'BOOM!', 'WHAM!'], sound: 'heavy' },
+    special: { kind: 'attack', label: 'Special', profile: 'special',    frame: 'kick',  range: 450, staminaCost: 25, accuracy: 0.90, multiplier: 2.50, critChance: 0.25, hitLevel: 'mid',  sfx: ['DESTROY!', 'ANNIHILATE!', 'DEVASTATE!'], sound: 'special' }
+};
+
+// Disjoint key groups — no physical key maps to both fighters.
+const VERSUS_KEYS = {
+    p1: { w: 'jump', a: 'left', s: 'crouch', d: 'right', q: 'block', e: 'dodge', z: 'punch', x: 'kick', c: 'heavy', v: 'special', ' ': 'jump' },
+    p2: { i: 'jump', j: 'left', k: 'crouch', l: 'right', u: 'block', o: 'dodge', b: 'punch', n: 'kick', m: 'heavy', p: 'special' }
+};
+const VS_EDGE_ACTIONS = new Set(['jump', 'dodge', 'punch', 'kick', 'heavy', 'special']);
+
+const vsClamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// Stateless strike-pose evaluator: mirrors AnimationSystem.playStrike's
+// kinematics as a pure function of elapsed time, so a fighter's swing never
+// depends on the (single-flight, global-lock) async animator.
+function versusAttackPose(p, tMs) {
+    if (!p || tMs < 0) return null;
+    const wu = p.windupMs || 0, st = p.strikeMs || 0, ho = p.holdMs || 0, rc = p.recoverMs || 0, se = p.settleMs || 0;
+    if (tMs >= wu + st + ho + rc + se) return null;
+    const baseX = (p.lunge || 0) + (p.anchor || 0);
+    const armWind = p.armWind || 0;
+    const dip = p.dip || 0;
+    const strikeY = (p.rise !== undefined && p.rise !== 0) ? p.rise : (p.lift ? -p.lift : dip);
+    const holdY = (p.rise !== undefined && p.rise !== 0) ? p.rise : -(p.lift || 0);
+    let t = tMs;
+    if (t < wu) {
+        const e = Ease.outQuad(wu ? t / wu : 1);
+        return { phase: 'windup', frame: 'idle', x: lerp(0, p.windupX || 0, e),
+                 y: p.dipFirst ? lerp(0, dip * 0.5, e) : 0,
+                 sx: lerp(1, p.squashX || 1, e), sy: lerp(1, p.squashY || 1, e), rot: 0,
+                 armDeg: lerp(0, armWind, e), armX: 0, impact: false };
+    }
+    t -= wu;
+    if (t < st) {
+        const tr = st ? t / st : 1;
+        const e = Ease.outCubic(tr);
+        return { phase: 'strike', frame: p.frame || 'punch',
+                 x: lerp(p.windupX || 0, baseX, e),
+                 y: lerp(p.dipFirst ? dip * 0.5 : 0, strikeY, e),
+                 sx: lerp(p.squashX || 1, 1, e), sy: lerp(p.squashY || 1, 1, e),
+                 rot: lerp(0, p.rot || 0, e),
+                 armDeg: lerp(armWind, p.armStrike !== undefined ? p.armStrike : 0, e),
+                 armX: lerp(0, 2, e), impact: tr >= 0.62 };
+    }
+    t -= st;
+    if (t < ho) {
+        const e = Ease.outQuad(ho ? t / ho : 1);
+        return { phase: 'hold', frame: p.frame || 'punch', x: baseX + 5 * e, y: holdY + 4 * e,
+                 sx: 1, sy: 1, rot: (p.rot || 0) * (1 - 0.3 * e),
+                 armDeg: lerp(p.armStrike || 0, 0, e), armX: lerp(2, 0, e), impact: true };
+    }
+    t -= ho;
+    if (t < rc) {
+        const e = Ease.inOutQuad(rc ? t / rc : 1);
+        return { phase: 'recover', frame: 'idle', x: lerp(baseX + 5 - (p.anchor || 0), 0, e),
+                 y: lerp(holdY + 4, 0, e), sx: 1, sy: 1, rot: lerp((p.rot || 0) * 0.7, 0, e),
+                 armDeg: -lerp(0, armWind * 0.8, e), armX: 0, impact: true };
+    }
+    t -= rc;
+    const e = Ease.outQuad(se ? t / se : 1);
+    const s = Math.sin(e * Math.PI);
+    return { phase: 'settle', frame: 'idle', x: -3 * s, y: 0, sx: 1 + 0.02 * s, sy: 1 - 0.03 * s, rot: 0, armDeg: 0, armX: 0, impact: true };
+}
+
+function versusAttackDuration(p) {
+    if (!p) return 0;
+    return ((p.windupMs || 0) + (p.strikeMs || 0) + (p.holdMs || 0) + (p.recoverMs || 0) + (p.settleMs || 0)) / 1000;
+}
+
+// Stateless hit-reaction evaluator (same REACTIONS presets as single-player).
+function versusHurtPose(react, tMs) {
+    if (!react) return null;
+    let t = tMs;
+    for (const step of react.seq || []) {
+        if (t < step.ms) {
+            const e = step.ms ? t / step.ms : 1;
+            return { x: step.x ? step.x(e) : 0, y: step.y ? step.y(e) : 0,
+                     sx: step.sx ? step.sx(e) : 1, sy: step.sy ? step.sy(e) : 1,
+                     rot: step.r ? step.r(e) : 0, headDeg: react.headDeg || 0 };
+        }
+        t -= step.ms;
+    }
+    const dur = react.recoverMs || 120;
+    const e = Ease.outQuad(dur ? Math.min(1, t / dur) : 1);
+    return { x: lerp(0, react.restX || 0, e), y: 0, sx: 1, sy: 1, rot: lerp(0, react.restR || 0, e), headDeg: react.headDeg || 0 };
+}
+
+function versusHurtDuration(react) {
+    if (!react) return 0.2;
+    const seq = (react.seq || []).reduce((s, st) => s + st.ms, 0);
+    return (seq + (react.recoverMs || 0)) / 1000;
+}
+
+// Jointly clamp both fighters' approach so sprites never fully overlap, while
+// each keeps its own retreat room. Pure => directly unit-testable.
+function clampVersusForwards(f1, f2, minF, maxF, maxApproach) {
+    let a = vsClamp(f1, minF, maxF);
+    let b = vsClamp(f2, minF, maxF);
+    let excess = (a + b) - maxApproach;
+    if (excess > 0) {
+        const roomA = a - minF, roomB = b - minF;
+        const total = roomA + roomB;
+        if (total > 0) {
+            const cutA = Math.min(roomA, excess * (roomA / total));
+            a -= cutA; excess -= cutA;
+            b -= Math.min(roomB, excess);
+        }
+    }
+    return [a, b];
+}
+
+/* -------------------------- Versus fighter ---------------------------- */
+class VersusFighter {
+    constructor(opts) {
+        this.player = opts.player;            // 1 | 2
+        this.name = opts.name;
+        this.char = opts.char;
+        this.sprite = opts.sprite;
+        this.arena = opts.arena;
+        this.dirSign = opts.player === 1 ? 1 : -1;   // screen-right maps to +forward for P1
+        this.reset();
+    }
+
+    reset() {
+        this.forward = 0;
+        this.y = 0; this.vy = 0; this.onGround = true;
+        this.state = 'idle';
+        this.attack = null; this.attackCd = 0;
+        this.dodgeT = 0; this.dodgeCd = 0; this.iFrames = 0;
+        this.hurt = null; this.hurtT = 0; this.hurtDur = 0;
+        this.flashT = 0; this.walkPhase = 0;
+        this.input = { left: false, right: false, crouch: false, block: false };
+        this._pose = null; this._frame = null; this._headKey = ''; this._armKey = '';
+        const c = this.sprite.canvas;
+        c.classList.remove('is-punching', 'is-kicking', 'is-active', 'flash-red',
+            'hurt-state', 'blocking', 'low-hp', 'ko-hero', 'ko-monster');
+        this.setBusy(false);
+        this.sprite.resetPose();
+        this.sprite.resetRig();
+        this.sprite.setFrame('idle');
+    }
+
+    currentStance() {
+        if (this.state === 'block') return 'block';
+        if (this.state === 'crouch') return 'crouch';
+        return 'idle';
+    }
+
+    setBusy(on) {
+        // Pause the idle footwork on BOTH the body and its rig overlays so the
+        // head/arms never bob out of sync with the torso during an action.
+        const toggle = (el) => { if (el && el.classList) el.classList.toggle('vs-busy', !!on); };
+        toggle(this.sprite.canvas);
+        toggle(this.sprite.rig && this.sprite.rig.head);
+        toggle(this.sprite.rig && this.sprite.rig.arm);
+    }
+
+    /* ------------------------- input edges ------------------------- */
+    onAction(action) {
+        if (this.state === 'ko' || this.arena.over || !this.arena.active) return;
+        if (action === 'jump') this.tryJump();
+        else if (action === 'dodge') this.tryDodge();
+        else if (VS_ATTACKS[action]) this.tryAttack(action);
+    }
+
+    tryJump() {
+        if (!this.onGround) return;
+        if (['attack', 'hurt', 'dodge', 'ko'].includes(this.state)) return;
+        this.vy = VS.JUMP_VY; this.y = 0.01; this.onGround = false;
+        this.state = 'jump';
+        this.setBusy(true);
+        SoundFX.jump();
+    }
+
+    tryDodge() {
+        if (!this.onGround) return;
+        if (this.dodgeCd > 0 || ['attack', 'hurt', 'dodge', 'ko'].includes(this.state)) return;
+        if (!this.char.canSpend({ staminaCost: VS.DODGE_COST })) return;
+        this.char.currentStamina = Math.max(0, this.char.currentStamina - VS.DODGE_COST);
+        this.state = 'dodge'; this.dodgeT = VS.DODGE_MS / 1000;
+        this.dodgeCd = VS.DODGE_COOLDOWN_MS / 1000; this.iFrames = VS.DODGE_IFRAME_MS / 1000;
+        this.setBusy(true);
+        SoundFX.dodge();
+    }
+
+    tryAttack(action) {
+        const move = VS_ATTACKS[action];
+        if (!move) return;
+        if (['attack', 'hurt', 'dodge', 'ko'].includes(this.state)) return;
+        if (this.attackCd > 0) return;
+        if (!this.char.canSpend(move)) {
+            this.arena.ui.addLog(`<b>${this.name}</b> is too tired to ${move.label}!`, this.player === 1 ? 'player-log' : 'enemy-log');
+            return;
+        }
+        this.char.spend(move);
+        this.attack = { action, move, profile: ANIM_PROFILES[move.profile] || ANIM_PROFILES.punch, t: 0, hitDone: false, impactPending: false };
+        this.state = 'attack';
+        this.sprite.canvas.classList.add(move.frame === 'kick' ? 'is-kicking' : 'is-punching', 'is-active');
+        this.setBusy(true);
+    }
+
+    /* ------------------------- per-frame --------------------------- */
+    advance(dt, opp) {
+        if (this.attackCd > 0) this.attackCd -= dt;
+        if (this.dodgeCd > 0) this.dodgeCd -= dt;
+        if (this.iFrames > 0) this.iFrames -= dt;
+        if (this.flashT > 0) { this.flashT -= dt; if (this.flashT <= 0) this.sprite.canvas.classList.remove('flash-red'); }
+        if (this.state !== 'ko') this.char.regenStamina(VS.STAMINA_REGEN * dt);
+
+        if (this.state === 'ko') { this._pose = null; return; }
+
+        if (this.state === 'hurt') {
+            this.hurtT += dt;
+            if (this.hurtT >= this.hurtDur) this.endHurt();
+            else { this._applyHurtPose(); return; }
+        }
+
+        if (this.state === 'attack') { this.updateAttack(dt, opp); return; }
+
+        if (this.state === 'dodge') {
+            this.dodgeT -= dt;
+            this.forward -= VS.DODGE_BACK * dt;    // slip away from the opponent
+            this._pose = { frame: 'idle', x: 0, y: 0, sx: 1, sy: 1, rot: this.dirSign * 6, armDeg: 0, armX: 0, headDeg: this.dirSign * 8 };
+            if (this.dodgeT <= 0) { this.state = 'idle'; this.setBusy(false); this.sprite.canvas.classList.remove('is-active'); }
+            return;
+        }
+
+        if (!this.onGround) {
+            this.vy -= VS.GRAVITY * dt;
+            this.y += this.vy * dt;
+            if (this.y <= 0) {
+                this.y = 0; this.vy = 0; this.onGround = true;
+                if (this.state === 'jump') this.state = 'idle';
+                this.setBusy(false);
+                this.arena.landDust(this);
+            }
+            this.applyGroundMove(dt, true);
+            this._pose = this.groundPose();
+            return;
+        }
+
+        if (this.state === 'jump') this.state = 'idle';
+        const wantCrouch = this.input.crouch;
+        const wantBlock = this.input.block && !wantCrouch;
+        if (wantCrouch) this.state = 'crouch';
+        else if (wantBlock) this.state = 'block';
+        else if (this.state === 'crouch' || this.state === 'block') this.state = 'idle';
+        this.setBusy(this.state === 'crouch');
+        this.applyGroundMove(dt, false);
+        this._pose = this.groundPose();
+    }
+
+    applyGroundMove(dt, airborne) {
+        const dir = (this.input.right ? 1 : 0) - (this.input.left ? 1 : 0);
+        if (dir !== 0 && this.state !== 'crouch' && this.state !== 'block') {
+            const spd = VS.WALK_SPEED * (airborne ? VS.AIR_CONTROL : 1);
+            this.forward += dir * this.dirSign * spd * dt;
+            this.walkPhase += dt * 11;
+            if (!airborne) this.state = 'walk';
+            this.setBusy(false);
+        } else if (!airborne && this.state === 'walk') {
+            this.state = 'idle';
+        }
+    }
+
+    groundPose() {
+        const s = Math.sin(this.walkPhase);
+        let x = 0, y = 0, sx = 1, sy = 1, rot = 0, armDeg = 0, armX = 0, headDeg = 0;
+        if (this.state === 'walk') {
+            y = -Math.abs(s) * 3;
+            rot = this.dirSign * s * 1.2;
+            armDeg = this.dirSign * s * 4;
+        } else if (this.state === 'crouch') {
+            sy = 0.90; sx = 1.03; y = 6;
+        } else if (this.state === 'block') {
+            armDeg = -42; armX = -6; rot = this.dirSign * -3;
+        }
+        this.sprite.canvas.classList.toggle('blocking', this.state === 'block');
+        return { frame: 'idle', x, y, sx, sy, rot, armDeg, armX, headDeg };
+    }
+
+    updateAttack(dt, opp) {
+        const a = this.attack;
+        a.t += dt;
+        const pose = versusAttackPose(a.profile, a.t * 1000);
+        if (!pose) { this.endAttack(); return; }
+        this._pose = { frame: pose.frame, x: pose.x, y: pose.y, sx: pose.sx, sy: pose.sy, rot: pose.rot, armDeg: pose.armDeg, armX: pose.armX, headDeg: 0 };
+        if (pose.impact && !a.hitDone) { a.hitDone = true; a.impactPending = true; }
+    }
+
+    endAttack() {
+        this.attack = null;
+        this.state = 'idle';
+        this.attackCd = VS.ATTACK_COOLDOWN_MS / 1000;
+        this.sprite.canvas.classList.remove('is-punching', 'is-kicking', 'is-active');
+        this.setBusy(false);
+        this._pose = this.groundPose();
+    }
+
+    /* --------------------------- damage ---------------------------- */
+    onHit(res) {
+        this.sprite.canvas.classList.add('flash-red');
+        this.flashT = VS.HURT_FLASH_MS / 1000;
+        const tier = res.isCritical ? 'crit' : (res.heavy ? 'heavy' : (res.low ? 'low' : 'light'));
+        this.hurt = REACTIONS[tier] || REACTIONS.light;
+        this.hurtDur = versusHurtDuration(this.hurt);
+        this.hurtT = 0;
+        this.state = 'hurt';
+        this.attack = null;
+        this.input.crouch = this.input.block = false;
+        this.sprite.canvas.classList.remove('is-punching', 'is-kicking', 'is-active', 'blocking');
+        this.sprite.canvas.classList.add('hurt-state');
+        this.setBusy(true);
+    }
+
+    onEvasive(res) {
+        this.sprite.canvas.classList.add('is-active');
+        this._pose = { frame: 'idle', x: 0, y: 0, sx: 1, sy: 1, rot: 0, armDeg: 0, armX: 0, headDeg: res.dodged ? this.dirSign * 8 : 0 };
+        setTimeout(() => this.sprite.canvas.classList.remove('is-active'), 250);
+    }
+
+    _applyHurtPose() {
+        const p = versusHurtPose(this.hurt, this.hurtT * 1000);
+        if (p) this._pose = { frame: 'idle', x: p.x, y: p.y, sx: p.sx, sy: p.sy, rot: p.rot, armDeg: 0, armX: 0, headDeg: p.headDeg };
+    }
+
+    endHurt() {
+        this.hurt = null;
+        this.state = 'idle';
+        this.sprite.canvas.classList.remove('hurt-state');
+        this.setBusy(false);
+        this._pose = this.groundPose();
+    }
+
+    startKO() {
+        this.state = 'ko';
+        this._pose = null;
+        this.setBusy(true);
+    }
+
+    /* --------------------------- rendering ------------------------- */
+    render() {
+        if (this.state === 'ko') return;              // playKO owns the fallen pose
+        const pose = this._pose || this.groundPose();
+        const frame = pose.frame || 'idle';
+        const sprite = this.sprite;
+        sprite.setFrame(frame);
+        const hk = `${frame}|${(pose.headDeg || 0).toFixed(1)}`;
+        if (hk !== this._headKey) {
+            this._headKey = hk;
+            if (frame !== 'kick') sprite.setRigPart('head', { deg: pose.headDeg || 0 });
+        }
+        const ak = `${frame}|${(pose.armDeg || 0).toFixed(1)}|${(pose.armX || 0).toFixed(1)}`;
+        if (ak !== this._armKey) {
+            this._armKey = ak;
+            if (frame !== 'kick') sprite.setRigPart('arm', { deg: pose.armDeg || 0, x: pose.armX || 0 });
+        }
+        sprite.setPose(this.forward + (pose.x || 0), -this.y + (pose.y || 0), pose.sx || 1, pose.sy || 1, pose.rot || 0);
+        if (sprite.shadow) {
+            const shift = this.player === 1 ? this.forward : -this.forward;
+            sprite.shadow.style.setProperty('transform', `translateX(${shift}px)`);
+        }
+    }
+}
+
+/* --------------------------- Versus arena ----------------------------- */
+class VersusArena {
+    constructor(opts) {
+        this.ui = opts.ui;
+        this.sprites = opts.sprites;
+        this.fx = opts.fx;
+        this.anim = opts.anim;
+        this.onEnd = opts.onEnd || (() => {});
+        this.container = UI.gameContainer;
+        this.running = false; this.over = false; this.active = false;
+        this.elapsed = 0; this._lastSec = -1; this._raf = 0;
+        this.keys = new Set();
+        this._kb = (e) => this._onKeyDown(e);
+        this._ku = (e) => this._onKeyUp(e);
+        this._blur = () => this.clearKeys();
+        this._vis = () => { if (document.hidden) this.clearKeys(); };
+        this._resize = () => this.layout();
+    }
+
+    layout() {
+        const hc = this.sprites.hero.canvas, mc = this.sprites.monster.canvas;
+        const hw = hc.offsetWidth || 300, mw = mc.offsetWidth || 300;
+        this.heroBase = hc.offsetLeft + hw / 2;
+        this.monBase = mc.offsetLeft + mw / 2;
+        const parent = hc.offsetParent;
+        this.layerW = (parent && parent.clientWidth) || this.container.clientWidth || 960;
+        const baseSep = this.monBase - this.heroBase;
+        const fw = Math.max(hw, mw);
+        this.minGap = Math.max(VS.MIN_GAP_PX, fw * VS.MIN_GAP_FACTOR);
+        this.maxApproach = Math.max(40, baseSep - this.minGap);
+    }
+
+    async start() {
+        this.stop();
+        this.running = true; this.over = false; this.active = false;
+        this.elapsed = 0; this._lastSec = -1;
+        this.keys = new Set();
+        this.p1 = new VersusFighter({ player: 1, name: 'PLAYER 1', char: new Character('Player 1', 220, 20), sprite: this.sprites.hero, arena: this });
+        this.p2 = new VersusFighter({ player: 2, name: 'PLAYER 2', char: new Character('Player 2', 220, 20), sprite: this.sprites.monster, arena: this });
+        this.p1.reset(); this.p2.reset();
+        this.layout();
+        applyFighterFilter(this.sprites.hero.canvas, 0, '', [this.sprites.hero.rig.head, this.sprites.hero.rig.arm]);
+        applyFighterFilter(this.sprites.monster.canvas, 190, '', [this.sprites.monster.rig.head, this.sprites.monster.rig.arm]);
+        window.addEventListener('resize', this._resize);
+        document.addEventListener('keydown', this._kb);
+        document.addEventListener('keyup', this._ku);
+        window.addEventListener('blur', this._blur);
+        document.addEventListener('visibilitychange', this._vis);
+        this._updateHUD(true, 0);
+        this.p1.render(); this.p2.render();
+        await sleep(650);
+        if (!this.running) return;
+        this.ui.showBanner('FIGHT!', 'round');
+        this.active = true;
+        this.lastTime = performance.now();
+        this._raf = requestAnimationFrame((t) => this._loop(t));
+    }
+
+    _loop(now) {
+        if (!this.running) return;
+        let dt = (now - this.lastTime) / 1000;
+        this.lastTime = now;
+        if (!(dt > 0)) dt = 1 / 60;
+        dt = Math.min(0.05, dt);                      // clamp tab-switch spikes
+        this.step(dt);
+        this._raf = requestAnimationFrame((t) => this._loop(t));
+    }
+
+    step(dt) {
+        if (!this.p1 || !this.p2) return;
+        if (this.over) return;                        // KO anims own the scene now
+        this.p1.advance(dt, this.p2);
+        this.p2.advance(dt, this.p1);
+        this._applyBounds();
+        // Capture both pending impacts BEFORE resolving either, so a trade
+        // still lands on both fighters in the same frame.
+        const hit1 = this.p1.attack && this.p1.attack.impactPending ? this.p1.attack : null;
+        const hit2 = this.p2.attack && this.p2.attack.impactPending ? this.p2.attack : null;
+        if (hit1) { this.p1.attack.impactPending = false; this.resolveStrike(this.p1, this.p2, hit1); }
+        if (hit2) { this.p2.attack.impactPending = false; this.resolveStrike(this.p2, this.p1, hit2); }
+        this.p1.render(); this.p2.render();
+        this._checkKO();
+        this._updateHUD(false, dt);
+    }
+
+    _applyBounds() {
+        const [a, b] = clampVersusForwards(this.p1.forward, this.p2.forward, VS.MIN_FORWARD, VS.MAX_FORWARD, this.maxApproach);
+        this.p1.forward = a; this.p2.forward = b;
+    }
+
+    separation() {
+        return (this.monBase - this.p2.forward) - (this.heroBase + this.p1.forward);
+    }
+
+    landDust(f) {
+        const p = this.anim.contactPoint(f.sprite, { x: 216, y: 360 });
+        this.fx.burst(p.x, p.y, { dir: f.player === 1 ? 1 : -1, sparks: 0, dust: 6 });
+    }
+
+    resolveStrike(atk, def, attack) {
+        const move = attack.move, profile = attack.profile;
+        const logCls = (isAtk) => isAtk ? (atk.player === 1 ? 'player-log' : 'enemy-log') : (def.player === 1 ? 'player-log' : 'enemy-log');
+        if (this.separation() > move.range) {
+            this.ui.showImpact(def.sprite.canvas, 'MISS', 'miss');
+            this.ui.addLog(`${atk.name}'s <b>${move.label}</b> whiffs.`, logCls(true));
+            return;
+        }
+        const roll = CombatSystem.rollAttack(atk.char, move);
+        if (roll.missed) {
+            this.ui.showImpact(def.sprite.canvas, 'MISS', 'miss');
+            this.ui.addLog(`${atk.name}'s <b>${move.label}</b> missed!`, logCls(true));
+            return;
+        }
+        let res;
+        if (def.iFrames > 0) {
+            res = { damage: 0, dodged: true };
+        } else {
+            def.char.stance = def.currentStance();
+            res = CombatSystem.resolveIncoming(def.char, roll.raw, move);
+        }
+        res.isCritical = roll.isCritical;
+        res.raw = roll.raw;
+        res.heavy = !!profile.heavy;
+        res.low = !!profile.low;
+
+        if (res.dodged || res.evaded) {
+            this.ui.showImpact(def.sprite.canvas, res.dodged ? 'DODGED!' : 'EVADED!', res.dodged ? 'dodged' : 'miss');
+            def.onEvasive(res);
+            this.ui.addLog(res.dodged ? `${def.name} dodges!` : `${def.name} ducks under it!`, 'system-log');
+            return;
+        }
+
+        const contact = this.anim.contactPoint(atk.sprite, profile.point);
+        const dir = atk.player === 1 ? 1 : -1;
+
+        if (res.blocked) {
+            const dmg = def.char.takeDamage(res.damage);
+            res.damage = dmg;
+            triggerScreenShake(false);
+            this.fx.burst(contact.x, contact.y, { dir, sparks: 6, dust: 4, hue: 200 });
+            this.ui.showImpact(def.sprite.canvas, 'BLOCKED!', 'blocked');
+            this.ui.showDamageNumber(def.sprite.canvas, `${dmg}`, 'blocked-num');
+            SoundFX.block();
+            this.ui.addLog(`${def.name} blocks (${dmg} damage).`, 'system-log');
+            return;
+        }
+
+        const dmg = def.char.takeDamage(res.damage);
+        res.damage = dmg;
+        triggerScreenShake(res.isCritical || res.heavy);
+        this.fx.burst(contact.x, contact.y, { dir, sparks: res.isCritical ? 44 : (res.heavy ? 32 : 20), dust: res.isCritical ? 12 : 7, crit: res.isCritical, hue: profile.glow ? 45 : 28 });
+        this.ui.showDamageNumber(def.sprite.canvas, `${dmg}${res.isCritical ? '!' : ''}`, res.isCritical ? 'crit' : '');
+        const word = (move.sfx && move.sfx[(Math.random() * move.sfx.length) | 0]) || 'POW!';
+        this.ui.showImpact(def.sprite.canvas, word, `${move.frame === 'kick' ? 'kick' : 'punch'}${res.isCritical ? ' crit' : ''}`);
+        if (profile.glow) SoundFX.special();
+        else if (res.isCritical) SoundFX.crit();
+        else if (SoundFX[move.sound]) SoundFX[move.sound]();
+        def.onHit(res);
+        this.ui.addLog(`${atk.name} hits <b>${def.name}</b> with ${move.label} — ${dmg} damage${res.isCritical ? ' <b>CRITICAL!</b>' : ''}`, res.isCritical ? 'crit-log' : logCls(true));
+    }
+
+    _checkKO() {
+        if (this.p1.char.isAlive() && this.p2.char.isAlive()) return;
+        this.over = true; this.active = false;
+        const winner = this.p1.char.isAlive() ? this.p1 : this.p2;
+        const loser = winner === this.p1 ? this.p2 : this.p1;
+        loser.startKO();
+        this.ui.setTimer('K.O.');
+        this.ui.setTurn('', false, false);
+        Promise.resolve(this.anim.playKO(loser.sprite, loser.player === 1)).catch(() => {});
+        if (winner.player === 1) SoundFX.victory(); else SoundFX.defeat();
+        setTimeout(() => {
+            if (!this.over) return;
+            this.onEnd(winner.player);
+            this.stop();
+        }, 1150);
+    }
+
+    _updateHUD(force, dt = 0) {
+        if (!this.over) {
+            this.elapsed += dt;
+            const s = Math.floor(this.elapsed);
+            if (force || s !== this._lastSec) { this._lastSec = s; this.ui.setTimer(`ROUND — ${s}s`); }
+        }
+        const upd = (f, side, isHero) => {
+            const hp = f.char.currentHealth;
+            if (force || hp !== this['hp' + side]) {
+                this['hp' + side] = hp;
+                const el = isHero ? UI.hero : UI.monster;
+                const pct = this.ui.setBar(el.healthBar, el.healthValue, hp, f.char.maxHealth);
+                el.healthBar.classList.toggle('low', pct <= 30);
+                el.healthBar.classList.toggle('critical', pct <= 25);
+                el.canvas.classList.toggle('low-hp', pct <= 25);
+            }
+            const st = Math.round(f.char.currentStamina);
+            if (force || st !== this['st' + side]) {
+                this['st' + side] = st;
+                const el = isHero ? UI.hero : UI.monster;
+                this.ui.setBar(el.staminaBar, el.staminaValue, st, f.char.maxStamina);
+            }
+        };
+        upd(this.p1, 1, true);
+        upd(this.p2, 2, false);
+    }
+
+    /* --------------------------- input ----------------------------- */
+    _mapFor(key) {
+        if (VERSUS_KEYS.p1[key]) return { player: 1, action: VERSUS_KEYS.p1[key] };
+        if (VERSUS_KEYS.p2[key]) return { player: 2, action: VERSUS_KEYS.p2[key] };
+        return null;
+    }
+
+    _onKeyDown(e) {
+        if (!this.running) return;
+        if (e.repeat) return;
+        if (e.target && /input|textarea/i.test(e.target.tagName)) return;
+        const key = (e.key || '').toLowerCase();
+        const map = this._mapFor(key);
+        if (!map) return;
+        e.preventDefault();
+        const token = key + '|' + map.player;
+        if (this.keys.has(token)) return;         // suppress key-repeat storms
+        this.keys.add(token);
+        const f = map.player === 1 ? this.p1 : this.p2;
+        if (!f) return;
+        if (map.action === 'left') f.input.left = true;
+        else if (map.action === 'right') f.input.right = true;
+        else if (map.action === 'crouch') f.input.crouch = true;
+        else if (map.action === 'block') f.input.block = true;
+        if (VS_EDGE_ACTIONS.has(map.action)) f.onAction(map.action);
+    }
+
+    _onKeyUp(e) {
+        const key = (e.key || '').toLowerCase();
+        const map = this._mapFor(key);
+        if (!map) return;
+        this.keys.delete(key + '|' + map.player);
+        const f = map.player === 1 ? this.p1 : this.p2;
+        if (!f) return;
+        if (map.action === 'left') f.input.left = false;
+        else if (map.action === 'right') f.input.right = false;
+        else if (map.action === 'crouch') f.input.crouch = false;
+        else if (map.action === 'block') f.input.block = false;
+    }
+
+    clearKeys() {
+        this.keys.clear();
+        for (const f of [this.p1, this.p2]) {
+            if (f) f.input = { left: false, right: false, crouch: false, block: false };
+        }
+    }
+
+    stop() {
+        this.running = false; this.active = false;
+        if (this._raf) { cancelAnimationFrame(this._raf); this._raf = 0; }
+        document.removeEventListener('keydown', this._kb);
+        document.removeEventListener('keyup', this._ku);
+        window.removeEventListener('blur', this._blur);
+        document.removeEventListener('visibilitychange', this._vis);
+        window.removeEventListener('resize', this._resize);
+        if (this.keys) this.clearKeys();
     }
 }
 
