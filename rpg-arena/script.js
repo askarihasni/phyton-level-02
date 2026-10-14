@@ -209,6 +209,67 @@ const FIGHTER_FRAMES = {
 const SPRITE_WIDTH = 400;
 const spriteCache = new Map();
 
+// Green-screen + baked-floor removal applied IN PLACE to an RGBA buffer.
+//   key  = G - max(R,B)  ->  ~0 on the (dark) fighter, ~150 on the green screen
+//   alpha ramps 255..0 across [keyLo, CLEAR] so the silhouette edge stays
+//   anti-aliased instead of hard/jagged
+//   anything inside CORE of the sampled background colour is cleared outright
+//   kept pixels have G capped to max(R,B) (spill suppression) so no green
+//   fringe / halo survives at the edges, while body colours are untouched
+// The source art also bakes a soft grey GROUND PANEL/ellipse under the feet
+// (only ~7% green, so chroma alone cannot see it). In the bottom band any
+// low-saturation mid/light pixel is faded out; the fighter's near-black legs
+// and shoes (low luminance) and its saturated skin stay intact.
+// Returns the background greenness when keying ran, or -1 when the corner
+// colour is not a green screen (so non-green art is never erased).
+function keyGreenScreen(d, W, H, bgR, bgG, bgB) {
+    const bgGreen = bgG - Math.max(bgR, bgB);
+    if (bgGreen <= 60) return -1;
+    const keyLo = 2;                                   // key <= keyLo  -> opaque
+    // Clear threshold: a small fraction of the screen's own greenness. Low
+    // enough to erase the shadowed floor gradient and the anti-aliased green
+    // outline, yet far above the fighter's own colours (key <= ~0 on the body).
+    const CLEAR = Math.min(26, Math.max(12, Math.round(bgGreen * 0.10)));
+    const CORE = 40;                                   // within CORE of bg -> clear
+    const groundY = Math.round(H * 0.88);              // top of the baked ground band
+    const LUM_LO = 62, LUM_HI = 96;                    // fade ramp for the grey panel
+    for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        const mx = Math.max(r, b);
+        const key = g - mx;
+        const dr = r - bgR, dg = g - bgG, db = b - bgB;
+        const distBg = Math.sqrt(dr * dr + dg * dg + db * db);
+        let a;
+        if (distBg <= CORE || key >= CLEAR) a = 0;
+        else if (key <= keyLo) a = 255;
+        else a = Math.round(255 * (CLEAR - key) / (CLEAR - keyLo));
+        if (a > 0) {
+            const px = i >> 2;
+            if (px >= groundY * W) {                    // bottom (ground) band only
+                const mx3 = Math.max(r, g, b), mn3 = Math.min(r, g, b);
+                const sat = mx3 > 0 ? (mx3 - mn3) / mx3 : 0;
+                if (sat < 0.25) {                       // neutral grey panel, not skin
+                    const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+                    let f = (lum - LUM_LO) / (LUM_HI - LUM_LO);
+                    if (f > 0) { if (f > 1) f = 1; a = Math.round(a * (1 - f)); }
+                }
+            }
+            if (a > 0) {
+                // Spill suppression: a kept pixel can never be greener than its
+                // own non-green channels. The fighter body is dark/brown
+                // (key <= 0), so G is already <= mx and only green edges cap.
+                if (g > mx) d[i + 1] = mx;
+                d[i + 3] = a;
+            } else {
+                d[i + 3] = 0;
+            }
+        } else {
+            d[i + 3] = 0;
+        }
+    }
+    return bgGreen;
+}
+
 function loadKeyedSprite(imgSrc) {
     if (spriteCache.has(imgSrc)) return spriteCache.get(imgSrc);
     const promise = new Promise((resolve, reject) => {
@@ -223,15 +284,23 @@ function loadKeyedSprite(imgSrc) {
             const ctx = canvas.getContext('2d', { willReadFrequently: true });
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
             try {
-                const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-                const l = frame.data.length / 4;
-                for (let i = 0; i < l; i++) {
-                    const r = frame.data[i * 4 + 0];
-                    const g = frame.data[i * 4 + 1];
-                    const b = frame.data[i * 4 + 2];
-                    if (g > 150 && g > r * 1.5 && g > b * 1.5) frame.data[i * 4 + 3] = 0;
+                const W = canvas.width, H = canvas.height;
+                // Read the REAL background colour from the four corners instead
+                // of guessing a constant. The fighter JPEGs are a flat green
+                // screen (~R34 G190 B41); sampling keeps the key correct even if
+                // an asset is re-exported with a slightly different green.
+                const P = 8;
+                const corn = [[0, 0], [W - P, 0], [0, H - P], [W - P, H - P]];
+                const sr = [], sg = [], sb = [];
+                for (const [cx, cy] of corn) {
+                    const cd = ctx.getImageData(cx, cy, P, P).data;
+                    for (let i = 0; i < cd.length; i += 4) { sr.push(cd[i]); sg.push(cd[i + 1]); sb.push(cd[i + 2]); }
                 }
-                ctx.putImageData(frame, 0, 0);
+                const median = (a) => { const s = a.slice().sort((x, y) => x - y); return s[s.length >> 1]; };
+                const frame = ctx.getImageData(0, 0, W, H);
+                if (keyGreenScreen(frame.data, W, H, median(sr), median(sg), median(sb)) >= 0) {
+                    ctx.putImageData(frame, 0, 0);
+                }
             } catch (e) {
                 // Tainted canvas — browsers block pixel reads on file:// pages
                 // (no --allow-file-access-from-files), so green-screen removal
@@ -246,10 +315,15 @@ function loadKeyedSprite(imgSrc) {
     return promise;
 }
 
-function applyFighterFilter(canvas, hueRotate = 0, extra = '', layers = []) {
+function applyFighterFilter(canvas, hueRotate = 0, extra = '', layers = [], chroma = false) {
+    // When the canvas pixel-read was blocked (file://) the frames still carry
+    // their green screen, so prepend the SVG chroma-key. It runs on the raw
+    // colours BEFORE hue-rotate (otherwise the green would be recoloured first)
+    // and, thanks to feComposite "in", leaves an already-keyed canvas untouched.
+    const pre = chroma ? 'url(#chromakey) ' : '';
     const filter = hueRotate !== 0
-        ? `drop-shadow(10px 20px 10px rgba(0,0,0,0.8)) hue-rotate(${hueRotate}deg) ${extra}`
-        : `drop-shadow(10px 20px 10px rgba(0,0,0,0.8)) ${extra}`;
+        ? `${pre}drop-shadow(10px 20px 10px rgba(0,0,0,0.8)) hue-rotate(${hueRotate}deg) ${extra}`
+        : `${pre}drop-shadow(10px 20px 10px rgba(0,0,0,0.8)) ${extra}`;
     canvas.style.filter = filter;
     // Rig overlay layers (head / front-arm) must share the fighter's look.
     for (const L of layers) if (L) L.style.filter = filter;
@@ -304,6 +378,7 @@ function pointInPoly(x, y, poly) {
 class FighterSprite {
     constructor(canvas, side) {
         this.canvas = canvas;
+        canvas.__fighter = this;               // back-ref for class sync helpers
         this.ctx = canvas.getContext('2d', { willReadFrequently: true });
         this.side = side;                     // 'hero' | 'monster'
         this.flipped = side === 'monster';    // monster art faces left
@@ -332,13 +407,20 @@ class FighterSprite {
             this.canvas.parentElement.appendChild(layer);
             this.rig[part] = layer;
         }
-        // Floor shadow: a grounded ellipse that sits under the fighter and
-        // never moves with the inline pose (fights 'float' above it).
+        // Floor shadows: a WIDE soft "weight" ellipse plus a TIGHT dark
+        // "contact" ellipse under the shoes. Both are anchored to the deck (they
+        // never travel with the inline body pose, so the feet can't float away
+        // from them) and are driven by --sh-scale / --sh-op, which setPose()
+        // updates from the body's vertical offset (jump fades/shrinks them,
+        // crouch widens them, landing restores them).
         const shadowHost = document.createElement('div');
         shadowHost.className = `fighter-shadow ${this.flipped ? 'monster-shadow' : 'hero-shadow'}`;
         const ellipse = document.createElement('div');
         ellipse.className = 'shadow-ellipse';
+        const contact = document.createElement('div');
+        contact.className = 'shadow-contact';
         shadowHost.appendChild(ellipse);
+        shadowHost.appendChild(contact);
         this.canvas.parentElement.appendChild(shadowHost);
         this.shadow = shadowHost;
     }
@@ -349,6 +431,12 @@ class FighterSprite {
     // anti-aliased fringes. Both derive from the SAME keyed frame, which is
     // what lets the dynamic re-cut below be seamless at every angle.
     _buildHeadRigs() {
+        // Browsers block canvas pixel reads on file:// (no --allow-file-access-
+        // from-files), so the frames keep their green screen and the rig's hard
+        // rectangular clips would paste green boxes around the head/arms. In
+        // that case the rig is disabled (the base frame already contains the
+        // head and arm) and the SVG chroma-key removes the green instead.
+        this.unkeyed = !!(this.frames.idle && this.frames.idle.__unkeyed);
         this.headSprites = {};
         this.baseBody = {};
         const { x: bx, y: by, w: bw, h: bh } = HEAD_BOX;
@@ -361,7 +449,7 @@ class FighterSprite {
             base.width = W; base.height = H;
             const bctx = base.getContext('2d', { willReadFrequently: true });
             try { bctx.drawImage(frame, 0, 0, W, H); } catch (e) { /* shim */ }
-            if (RIG_ERASED.has(name)) {
+            if (!this.unkeyed && RIG_ERASED.has(name)) {
                 let bd = null;
                 try { bd = bctx.getImageData(0, 0, W, H); } catch (e) { bd = null; }
                 if (bd) {
@@ -376,7 +464,7 @@ class FighterSprite {
             }
             this.baseBody[name] = base;
 
-            if (!RIG_ERASED.has(name)) { this.headSprites[name] = null; continue; }
+            if (this.unkeyed || !RIG_ERASED.has(name)) { this.headSprites[name] = null; continue; }
 
             // (b) head overlay: frame pixels within the silhouette (1px grown)
             let fd = null;
@@ -400,9 +488,16 @@ class FighterSprite {
             try { hd = hctx.getImageData(0, 0, W, H); } catch (e) { hd = null; }
             if (hd) {
                 const d = hd.data;
-                for (let y = by - 1; y < by + bh + 1; y++) {
-                    for (let x = bx - 1; x < bx + bw + 1; x++) {
-                        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+                // Keep ONLY the head: clear every pixel that is not part of the
+                // head silhouette (grown 1px). The previous loop was bounded to
+                // HEAD_BOX, so everything outside it (the whole torso, arms and
+                // legs) stayed opaque in the overlay — any head tilt then dragged
+                // a rotated copy of the entire fighter across the body and left
+                // the un-cleared background showing through as a rectangular
+                // patch. Looping the full canvas keeps the head naturally
+                // connected while discarding everything that isn't head.
+                for (let y = 0; y < H; y++) {
+                    for (let x = 0; x < W; x++) {
                         if (!anyAround(x, y, 1)) d[(y * W + x) * 4 + 3] = 0;
                     }
                 }
@@ -459,7 +554,12 @@ class FighterSprite {
         } catch (e) { return; }
         const sdd = sd.data, bdd = bd.data;
         for (let i = 3; i < bdd.length; i += 4) {
-            if (sdd[i] > 8) bdd[i] = 0;
+            // Carve only where the head overlay is actually OPAQUE (alpha > 24).
+            // Carving under its soft anti-aliased fringe left a few semi-transparent
+            // pixels at the neck with no backing; leaving the body's own pixels
+            // there keeps the neck solid (the body and head are the same frame, so
+            // the overlap is seamless and never doubles).
+            if (sdd[i] > 24) bdd[i] = 0;
         }
         try { this.ctx.putImageData(bd, R.x0, R.y0); } catch (e) { /* shim */ }
     }
@@ -493,6 +593,11 @@ class FighterSprite {
         const layer = this.rig[part];
         const frame = this.frames[name];
         if (!layer || !frame) return;
+        // Un-keyed frames (file://) keep their green backing, so overlay layers
+        // are left hidden: the base canvas already shows the full fighter and
+        // the SVG chroma-key removes the green. Drawing a clipped overlay here
+        // would paste a green rectangle/polygon over the body.
+        if (this.unkeyed) { layer.classList.add('hidden'); return; }
         const cfg = RIG_PARTS[part];
         const ctx = layer.getContext('2d');
         ctx.save();
@@ -557,16 +662,45 @@ class FighterSprite {
 
     // x > 0 always means "toward the opponent" (flip handles direction).
     // r = rotation in degrees (for uppercut / roundhouse body torque).
+    // y < 0 lifts the body off the floor (jump / leaping kick / KO stagger);
+    // y > 0 sinks it (crouch). The shadow reacts to that offset right here so
+    // grounding stays consistent for every single- and two-player action.
     setPose(x = 0, y = 0, sx = 1, sy = 1, r = 0) {
         this.poseString = this._poseString(x, y, sx, sy, r);
         this.canvas.style.transform = this.poseString;
         this._applyTransforms();
+        // The shadow slides with the body's horizontal offset so the contact
+        // patch always sits under the feet (x > 0 is "toward opponent", which is
+        // screen-left for the flipped monster — hence the flip-aware sign).
+        this._updateShadow(y, sy, this.flipped ? -x : x);
+    }
+
+    // Push the current body height + horizontal offset into the shadow's CSS
+    // vars. Grounded => full spread/opacity; airborne => the shadow shrinks,
+    // fades and softens (a real shadow spreads and dims as the caster rises); a
+    // low crouch spreads it a touch (weight pressing down).
+    _updateShadow(y, sy = 1, shX = 0) {
+        const host = this.shadow;
+        if (!host || !host.style || typeof host.style.setProperty !== 'function') return;
+        const lift = Math.max(0, -y);           // px of air under the feet
+        const sink = Math.max(0, y);            // px the body has dropped
+        const k = Math.min(1, lift / 64);       // 0 grounded .. 1 at apex
+        const spread = (1 - 0.34 * k) * (1 + Math.min(0.14, sink * 0.012));
+        const op = (1 - 0.52 * k) * (1 + Math.min(0.10, sink * 0.008));
+        host.style.setProperty('--sh-scale', Math.min(1.18, spread).toFixed(3));
+        host.style.setProperty('--sh-op', Math.min(1, op).toFixed(3));
+        host.style.setProperty('--sh-x', `${(shX || 0).toFixed(1)}px`);
     }
 
     resetPose() {
         this.poseString = '';
         this.canvas.style.transform = '';
         this._applyTransforms();
+        if (this.shadow && this.shadow.style && typeof this.shadow.style.setProperty === 'function') {
+            this.shadow.style.setProperty('--sh-scale', '1');
+            this.shadow.style.setProperty('--sh-op', '1');
+            this.shadow.style.setProperty('--sh-x', '0px');
+        }
     }
 
     _applyTransforms() {
@@ -579,6 +713,34 @@ class FighterSprite {
     resetRig() {
         for (const part of Object.keys(RIG_PARTS)) this.setRigPart(part, { deg: 0, x: 0, y: 0 });
     }
+
+    // Toggle a visual-state class on the body AND both rig overlays. The head
+    // and arm layers are carved out of the body, so any CSS animation that
+    // sways/scales the body must move them identically — otherwise the carved
+    // seams open and the head/arm look detached. Safe on stubs without rigs.
+    setStateClass(cls, on) {
+        const t = (el) => { if (el && el.classList) el.classList.toggle(cls, !!on); };
+        t(this.canvas);
+        if (this.rig) { t(this.rig.head); t(this.rig.arm); }
+    }
+}
+
+/* ---- Fighter state-class helpers (keep body + rig overlays in lock-step) ----
+   These classes drive CSS animations that move the body; applied to the body
+   canvas alone they would desync the carved head/arm overlays. Route every
+   add/remove through here so both layers animate as one. */
+const FIGHTER_STATE_CLASSES = ['low-hp', 'hurt-state', 'enraged', 'ko-hero', 'ko-monster'];
+function setFighterClass(canvas, cls, on) {
+    const s = canvas && canvas.__fighter;
+    if (s) s.setStateClass(cls, on);
+    else if (canvas && canvas.classList) canvas.classList.toggle(cls, !!on);
+}
+function clearFighterStates(canvas) {
+    const s = canvas && canvas.__fighter;
+    for (const cls of FIGHTER_STATE_CLASSES) {
+        if (s) s.setStateClass(cls, false);
+        else if (canvas && canvas.classList) canvas.classList.remove(cls);
+    }
 }
 
 /* ============================ PARTICLE FX ================================ */
@@ -590,6 +752,7 @@ class ParticleFX {
         this.particles = [];
         this.running = false;
         this.lastTime = 0;
+        this._seed = 0x9e3779b9 >>> 0;   // local LCG for deterministic FX
         this.resize();
         this._onResize = () => this.resize();
         window.addEventListener('resize', this._onResize);
@@ -629,6 +792,33 @@ class ParticleFX {
             });
         }
 
+        if (!this.running) {
+            this.running = true;
+            this.lastTime = performance.now();
+            requestAnimationFrame(t => this.loop(t));
+        }
+    }
+
+    // Deterministic dust spawner for foot-contact effects. It draws from a
+    // private LCG instead of Math.random so cosmetic dust can be added without
+    // perturbing the seeded gameplay RNG (the deterministic full-run regression
+    // in test-flow.js depends on the exact Math.random() sequence).
+    _rnd() {
+        this._seed = (Math.imul(this._seed, 1664525) + 1013904223) >>> 0;
+        return this._seed / 4294967296;
+    }
+
+    footDust(x, y, { dir = 1, count = 8 } = {}) {
+        for (let i = 0; i < count; i++) {
+            const a = this._rnd(), b = this._rnd(), c = this._rnd(), d = this._rnd(), e = this._rnd();
+            this.particles.push({
+                type: 'dust',
+                x: x + (a - 0.5) * 20, y: y + (b - 0.5) * 20,
+                vx: dir * (0.3 + c * 1.9), vy: -1.4 + d * 1.8,
+                age: 0, life: 550 + e * 350,
+                r0: 5 + a * 5, r1: 24 + b * 16
+            });
+        }
         if (!this.running) {
             this.running = true;
             this.lastTime = performance.now();
@@ -781,33 +971,35 @@ const BOOT = { x: 361, y: 158 };
 const ANIM_PROFILES = {
     // --- punches (grounded arm extension, hip drive, body lean) ---
     // armWind/armStrike drive the overlay arm layer: chamber -> extend -> snap.
+    // rot = hip/shoulder rotation at impact; windupRot = the opposite coil that
+    // precedes it (anticipation); head = chin/head follow-through toward target.
     jab: { frame: 'punch', cls: 'is-punching', windupMs: 40, strikeMs: 55, holdMs: 90, recoverMs: 100, settleMs: 60,
-           lunge: 16, dip: 2, rise: 0, rot: 0, windupX: -5, squashX: 0.99, squashY: 1.01,
+           lunge: 16, dip: 2, rise: 0, rot: -3, windupRot: 2, head: 5, windupX: -5, squashX: 0.99, squashY: 1.01,
            armWind: -16, armStrike: 4,
            anchor: 0, point: FIST, radius: 20, heavy: false },
     punch: { frame: 'punch', cls: 'is-punching', windupMs: 70, strikeMs: 75, holdMs: 160, recoverMs: 130, settleMs: 90,
-           lunge: 30, dip: 4, rise: 0, rot: 0, windupX: -8, squashX: 0.98, squashY: 1.01,
+           lunge: 30, dip: 4, rise: 0, rot: -4, windupRot: 3, head: 6, windupX: -8, squashX: 0.98, squashY: 1.01,
            armWind: -24, armStrike: 8,
            anchor: 0, point: FIST, radius: 22, heavy: false },
     heavyPunch: { frame: 'punch', cls: 'is-punching', windupMs: 130, strikeMs: 95, holdMs: 200, recoverMs: 150, settleMs: 100,
-           lunge: 46, dip: 6, rise: -2, rot: -3, windupX: -16, squashX: 0.965, squashY: 1.03,
+           lunge: 46, dip: 6, rise: -2, rot: -7, windupRot: 5, head: 7, windupX: -16, squashX: 0.965, squashY: 1.03,
            armWind: -32, armStrike: 12,
            anchor: 0, point: FIST, radius: 28, heavy: true },
     uppercut: { frame: 'punch', cls: 'is-punching', windupMs: 110, strikeMs: 115, holdMs: 150, recoverMs: 150, settleMs: 90,
-           lunge: 24, dip: 14, rise: -34, rot: -7, windupX: -12, squashX: 1.02, squashY: 0.94,
+           lunge: 24, dip: 14, rise: -34, rot: -9, windupRot: -4, head: -4, windupX: -12, squashX: 1.02, squashY: 0.94,
            armWind: 44, armStrike: -38,
            anchor: 0, point: FIST, radius: 26, heavy: true, dipFirst: true },
     // --- kicks (planted support leg, lifting striking leg, hip rotation) ---
     frontKick: { frame: 'kick', cls: 'is-kicking', windupMs: 70, strikeMs: 95, holdMs: 170, recoverMs: 140, settleMs: 90,
-           lunge: 42, lift: 26, rise: 0, rot: -3, windupX: -10, anchor: 46, point: BOOT, radius: 24, heavy: false },
+           lunge: 42, lift: 26, rise: 0, rot: -4, windupRot: 3, head: 4, windupX: -10, anchor: 46, point: BOOT, radius: 24, heavy: false },
     lowKick: { frame: 'kick', cls: 'is-kicking', windupMs: 60, strikeMs: 85, holdMs: 130, recoverMs: 130, settleMs: 80,
-           lunge: 46, lift: 6, rise: 0, rot: 4, windupX: -9, anchor: 46, point: BOOT, radius: 24, heavy: false, low: true },
+           lunge: 46, lift: 6, rise: 0, rot: 4, windupRot: -3, head: 3, windupX: -9, anchor: 46, point: BOOT, radius: 24, heavy: false, low: true },
     roundhouse: { frame: 'kick', cls: 'is-kicking', windupMs: 120, strikeMs: 115, holdMs: 230, recoverMs: 170, settleMs: 110,
-           lunge: 54, lift: 46, rise: 0, rot: -14, windupX: -14, anchor: 46, point: BOOT, radius: 30, heavy: true, spin: true, trail: true },
+           lunge: 54, lift: 46, rise: 0, rot: -14, windupRot: 6, head: 6, windupX: -14, anchor: 46, point: BOOT, radius: 30, heavy: true, spin: true, trail: true },
     heavyKick: { frame: 'kick', cls: 'is-kicking', windupMs: 160, strikeMs: 130, holdMs: 300, recoverMs: 190, settleMs: 120,
-           lunge: 60, lift: 56, rise: 0, rot: -10, windupX: -18, anchor: 46, point: BOOT, radius: 34, heavy: true, trail: true },
+           lunge: 60, lift: 56, rise: 0, rot: -10, windupRot: 6, head: 6, windupX: -18, anchor: 46, point: BOOT, radius: 34, heavy: true, trail: true },
     special: { frame: 'kick', cls: 'is-kicking', windupMs: 200, strikeMs: 120, holdMs: 340, recoverMs: 200, settleMs: 130,
-           lunge: 66, lift: 62, rise: 0, rot: -16, windupX: -20, anchor: 46, point: BOOT, radius: 40, heavy: true, glow: true, trail: true }
+           lunge: 66, lift: 62, rise: 0, rot: -16, windupRot: 7, head: 7, windupX: -20, anchor: 46, point: BOOT, radius: 40, heavy: true, glow: true, trail: true }
 };
 
 /* ------------------ Defender hit-reaction presets ------------------------ */
@@ -815,31 +1007,31 @@ const ANIM_PROFILES = {
 // seq steps describe the out-and-back body sweep; x/r are signed so both a
 // hero and a (CSS-flipped) monster recoil away from the attacker.
 const REACTIONS = {
-    light: { knockX: 12, headDeg: -6, restX: 0, restR: 0, recoverMs: 140,
+    light: { knockX: 12, headDeg: -6, armDeg: 5, restX: 0, restR: 0, recoverMs: 140,
              seq: [
                  { ms: 90, x: t => -lerp(0, 14, t), y: t => 0, r: t => -lerp(0, 4, t) },
                  { ms: 100, x: t => -lerp(14, 1, t), y: t => 0, r: t => -lerp(4, 0, t) }
              ] },
-    low: { knockX: 8, headDeg: -7, restX: 0, restR: 0, recoverMs: 140,
+    low: { knockX: 8, headDeg: -7, armDeg: 4, restX: 0, restR: 0, recoverMs: 140,
            seq: [
                { ms: 80, x: t => -lerp(0, 10, t), y: t => lerp(0, 9, t), r: t => lerp(0, 3, t) },
                { ms: 90, x: t => -lerp(10, 0, t), y: t => lerp(9, 0, t), r: t => lerp(3, 0, t) }
            ] },
-    heavy: { knockX: 26, headDeg: -10, restX: 0, restR: 0, recoverMs: 190,
+    heavy: { knockX: 26, headDeg: -10, armDeg: -9, restX: 0, restR: 0, recoverMs: 190,
              seq: [
                  { ms: 110, x: t => -lerp(0, 42, Ease.outCubic(t)), y: t => -lerp(0, 12, t), r: t => -lerp(0, 10, t), sy: t => 1 - 0.08 * t },
                  { ms: 170, x: t => -lerp(42, 4, Ease.outQuad(t)), y: t => lerp(-12, 0, t), r: t => -lerp(10, 2, t), sy: t => 1 - 0.08 * (1 - t) }
              ] },
-    crit: { knockX: 34, headDeg: -13, restX: 0, restR: 0, recoverMs: 230,
+    crit: { knockX: 34, headDeg: -13, armDeg: -13, restX: 0, restR: 0, recoverMs: 230,
             seq: [
                 { ms: 120, x: t => -lerp(0, 58, Ease.outCubic(t)), y: t => -lerp(0, 18, t), r: t => -lerp(0, 14, t), sx: t => 1 + 0.1 * t, sy: t => 1 - 0.12 * t },
                 { ms: 210, x: t => -lerp(58, 6, Ease.outQuad(t)), y: t => lerp(-18, 0, t), r: t => -lerp(14, 3, t), sx: t => 1 + 0.1 * (1 - t), sy: t => 1 - 0.12 * (1 - t) }
             ] },
     // Non-damaging outcomes: a tiny head settle is enough (FX handles the rest).
-    dodge:   { knockX: 0, headDeg: 8, restX: 0, restR: 0, recoverMs: 120, seq: [] },
-    crouch:  { knockX: 0, headDeg: 0, restX: 0, restR: 0, recoverMs: 100, seq: [] },
-    block:   { knockX: 0, headDeg: -4, restX: 0, restR: 0, recoverMs: 90, seq: [] },
-    whiff:   { knockX: 0, headDeg: 0, restX: 0, restR: 0, recoverMs: 60, seq: [] }
+    dodge:   { knockX: 0, headDeg: 8, armDeg: 0, restX: 0, restR: 0, recoverMs: 120, seq: [] },
+    crouch:  { knockX: 0, headDeg: 0, armDeg: 0, restX: 0, restR: 0, recoverMs: 100, seq: [] },
+    block:   { knockX: 0, headDeg: -4, armDeg: -6, restX: 0, restR: 0, recoverMs: 90, seq: [] },
+    whiff:   { knockX: 0, headDeg: 0, armDeg: 0, restX: 0, restR: 0, recoverMs: 60, seq: [] }
 };
 
 /* ======================== COMBAT RESOLUTION ============================= */
@@ -1181,7 +1373,7 @@ class UIController {
         this.setBar(UI.hero.staminaBar, UI.hero.staminaValue, hero.currentStamina, hero.maxStamina);
         UI.hero.healthBar.classList.toggle('low', hpPct <= 30);
         UI.hero.healthBar.classList.toggle('critical', hpPct <= 25);
-        UI.hero.canvas.classList.toggle('low-hp', hpPct <= 25);
+        setFighterClass(UI.hero.canvas, 'low-hp', hpPct <= 25);
         UI.gameContainer.classList.toggle('player-low', hpPct <= 25);
         UI.hero.level.textContent = `Lv. ${hero.level}`;
 
@@ -1190,7 +1382,7 @@ class UIController {
             this.setBar(UI.monster.staminaBar, UI.monster.staminaValue, monster.currentStamina, monster.maxStamina);
             UI.monster.healthBar.classList.toggle('low', mPct <= 30);
             UI.monster.healthBar.classList.toggle('critical', mPct <= 25);
-            UI.monster.canvas.classList.toggle('low-hp', mPct <= 25);
+            setFighterClass(UI.monster.canvas, 'low-hp', mPct <= 25);
             UI.monster.name.textContent = monster.name;
             UI.monster.level.textContent = `Lv. ${monster.level}`;
         }
@@ -1349,8 +1541,8 @@ class UIController {
         UI.combo.classList.add('hidden');
         UI.hero.healthBar.classList.remove('low', 'critical');
         UI.monster.healthBar.classList.remove('low', 'critical');
-        UI.hero.canvas.classList.remove('low-hp', 'ko-hero', 'hurt-state');
-        UI.monster.canvas.classList.remove('low-hp', 'ko-monster', 'hurt-state', 'enraged');
+        clearFighterStates(UI.hero.canvas);
+        clearFighterStates(UI.monster.canvas);
         this.clearLog();
         this.addLog('<b>2-PLAYER VERSUS</b> — first to K.O. the other wins. Everyone fights at once!', 'system-log');
         this.syncDeckHeight();
@@ -1415,15 +1607,19 @@ class AnimationSystem {
         if (p.glow) sprite.canvas.style.filter += ' drop-shadow(0 0 18px rgba(255,210,60,0.95))';
 
         try {
-            // 1) WIND-UP: coil back / chamber the strike (arm loads, hips sink)
+            // 1) WIND-UP: coil back / chamber the strike (arm loads, hips sink,
+            //    torso counter-rotates away before it drives through)
             const armWind = p.armWind || 0;
+            const wRot = p.windupRot || 0;
             await tween(p.windupMs, t => {
                 sprite.setRigPart('arm', { deg: lerp(0, armWind, t) });
+                sprite.setRigPart('head', { deg: lerp(0, -(p.head || 0) * 0.35, t) });
                 sprite.setPose(
                     lerp(0, p.windupX, t),
                     p.dipFirst ? lerp(0, p.dip * 0.5, t) : 0,
                     lerp(1, p.squashX || 1, t),
-                    lerp(1, p.squashY || 1, t)
+                    lerp(1, p.squashY || 1, t),
+                    lerp(0, wRot, t)
                 );
             }, Ease.outQuad);
 
@@ -1438,13 +1634,14 @@ class AnimationSystem {
                 if (p.armStrike !== undefined) {
                     sprite.setRigPart('arm', { deg: lerp(armWind, p.armStrike, e), x: lerp(0, 2, e) });
                 }
+                sprite.setRigPart('head', { deg: lerp(-(p.head || 0) * 0.35, p.head || 0, e) });
                 if (p.trail && t > 0.35) this._trail(sprite, p, t);
                 sprite.setPose(
                     lerp(p.windupX, baseX, e),
                     lerp(p.dipFirst ? p.dip * 0.5 : 0, p.rise !== undefined && p.rise !== 0 ? p.rise : (p.lift ? -p.lift : (p.dip || 0)), e),
                     lerp(p.squashX || 1, 1, e),
                     lerp(p.squashY || 1, 1, e),
-                    lerp(0, p.rot || 0, e)
+                    lerp(wRot, p.rot || 0, e)
                 );
             });
             if (!applied && result.apply) { applied = true; result.apply(); }
@@ -1452,6 +1649,9 @@ class AnimationSystem {
             // 3) IMPACT: FX, shake, defender reaction and damage numbers fire
             //    (whiff / dodge / block branches also live in _impact).
             hitClasses = this._impact(sprite, defenderEl, isHero, result, p, hitStopMs);
+            // A heavy strike plants the lead foot hard: a restrained puff of
+            // floor dust under the attacker (never on light jabs).
+            if (p.heavy) this._footDust(sprite, { dust: 8 });
 
             // 4) HIT-STOP: freeze both fighters briefly on heavy/ultimate hits.
             if (hitStopMs > 0) await this._hitStop(hitStopMs);
@@ -1460,6 +1660,7 @@ class AnimationSystem {
             const holdY = p.rise !== undefined && p.rise !== 0 ? p.rise : -(p.lift || 0);
             await tween(p.holdMs, t => {
                 sprite.setRigPart('arm', { deg: lerp(p.armStrike || 0, 0, t), x: lerp(2, 0, t) });
+                sprite.setRigPart('head', { deg: (p.head || 0) * (1 - 0.4 * t) });
                 sprite.setPose(baseX + 5 * t, holdY + 4 * t, 1, 1, (p.rot || 0) * (1 - 0.3 * t));
             }, Ease.outQuad);
 
@@ -1468,6 +1669,7 @@ class AnimationSystem {
             await tween(p.recoverMs, t => {
                 const e = Ease.inOutQuad(t);
                 sprite.setRigPart('arm', { deg: -lerp(0, armWind * 0.8, e) });
+                sprite.setRigPart('head', { deg: lerp((p.head || 0) * 0.6, 0, e) });
                 sprite.setPose(
                     lerp(baseX + 5 - (p.anchor || 0), 0, e),
                     lerp(holdY + 4, 0, e),
@@ -1596,11 +1798,29 @@ class AnimationSystem {
         }
         defSprite.canvas.classList.add('is-active');
         const token = ++defSprite.reactToken;
+        // Coarse (1-degree) rig dedup: setRigPart carves pixels, so only pay for
+        // a redraw when the head/arm angle actually moves a visible amount.
+        let lastHead = null, lastArm = null;
+        const setHead = (deg) => {
+            const q = Math.round(deg);
+            if (q === lastHead) return;
+            lastHead = q;
+            defSprite.setRigPart('head', { deg });
+        };
+        const setArm = (deg) => {
+            const q = Math.round(deg);
+            if (q === lastArm) return;
+            lastArm = q;
+            defSprite.setRigPart('arm', { deg });
+        };
         (async () => {
             try {
                 if (delayMs > 0) await sleep(delayMs);
                 if (token !== defSprite.reactToken) return;
-                if (REACT.headDeg) defSprite.setRigPart('head', { deg: REACT.headDeg });
+                let head = REACT.headDeg || 0;
+                let arm = REACT.armDeg || 0;
+                if (head) setHead(head);
+                if (arm) setArm(arm);
                 for (const step of REACT.seq || []) {
                     if (token !== defSprite.reactToken) return;
                     await tween(step.ms, t => {
@@ -1612,13 +1832,21 @@ class AnimationSystem {
                             step.sy ? step.sy(t) : 1,
                             step.r(t)
                         );
+                        head = step.head ? step.head(t) : head;
+                        arm = step.arm ? step.arm(t) : arm;
+                        setHead(head);
+                        setArm(arm);
                     }, step.ease || Ease.outQuad);
                 }
                 if (token !== defSprite.reactToken) return;
+                // Recover: the whole body (and the head/arm overlays) ease back to
+                // the neutral guard together — nothing is left frozen mid-reaction.
                 await tween(REACT.recoverMs, t => {
                     if (token !== defSprite.reactToken) return;
                     const e = Ease.outQuad(t);
                     defSprite.setPose(lerp(0, REACT.restX, e), 0, 1, 1, lerp(0, REACT.restR, e));
+                    setHead(lerp(head, 0, e));
+                    setArm(lerp(arm, 0, e));
                 }, Ease.outQuad);
             } catch (e) { /* a reaction must never break the game */ }
             finally {
@@ -1647,14 +1875,33 @@ class AnimationSystem {
         );
     }
 
-    _landingDust(sprite) {
+    // Foot-on-floor anchor point for dust FX (bottom-centre of the fighter).
+    _footPoint(sprite) {
         const rect = sprite.canvas.getBoundingClientRect();
         const fxRect = UI.fxCanvas.getBoundingClientRect();
-        this.fx.burst(
-            rect.left - fxRect.left + rect.width * 0.5,
-            rect.top - fxRect.top + rect.height * 0.92,
-            { dir: sprite.flipped ? -1 : 1, sparks: 4, dust: 14 }
-        );
+        return {
+            x: rect.left - fxRect.left + rect.width * 0.5,
+            y: rect.top - fxRect.top + rect.height * 0.93,
+            dir: sprite.flipped ? -1 : 1
+        };
+    }
+
+    // Restrained ground dust kicked up at the feet on hard foot contact
+    // (heavy strike plant, dodge push-off). Deliberately routed through the
+    // deterministic fx.footDust() so adding this cosmetic feature never
+    // perturbs the seeded gameplay RNG used by the full-run regression.
+    _footDust(sprite, { dust = 8, dir } = {}) {
+        if (!sprite) return;
+        const p = this._footPoint(sprite);
+        this.fx.footDust(p.x, p.y, { dir: dir !== undefined ? dir : p.dir, count: dust });
+    }
+
+    // Landing dust. Kept on the original fx.burst() call (same particle counts)
+    // so the deterministic seeded flow is byte-for-byte unchanged.
+    _landingDust(sprite) {
+        if (!sprite) return;
+        const p = this._footPoint(sprite);
+        this.fx.burst(p.x, p.y, { dir: p.dir, sparks: 4, dust: 14 });
     }
 
     // Freeze both fighters: pause CSS animations on the container + a short
@@ -1728,6 +1975,7 @@ class AnimationSystem {
         if (anim === 'dodge') {
             // directional slip — body leans, feet stay planted, head tucks
             sprite.canvas.classList.add(cls);
+            this._footDust(sprite, { dust: 6 });   // push-off from the planted foot
             await tween(180, t => {
                 const e = Ease.outQuad(t);
                 sprite.setRigPart('head', { deg: 8, x: -5 });
@@ -1786,7 +2034,7 @@ class AnimationSystem {
             this._landingDust(sprite);
             await sleep(140);
         } finally {
-            sprite.canvas.classList.add(isHero ? 'ko-hero' : 'ko-monster');
+            setFighterClass(sprite.canvas, isHero ? 'ko-hero' : 'ko-monster', true);
             sprite.canvas.classList.remove('is-active');
             if (sprite.shadow) sprite.shadow.classList.remove('floated');
             // keep the fallen pose — only the rig settles back to neutral
@@ -1842,7 +2090,16 @@ class GameController {
         this._spritesReady = Promise.all([
             this.sprites.hero.load(FIGHTER_FRAMES),
             this.sprites.monster.load(FIGHTER_FRAMES)
-        ]).catch(err => console.error('Sprite load failed:', err));
+        ]).then(() => {
+            // Only when the browser blocked the canvas pixel-read (file://) does
+            // the hero need an inline filter, to run the SVG chroma-key. Served
+            // over http:// we leave it untouched so the CSS stance filters
+            // (.blocking / .healing glows) keep working exactly as before.
+            if (this.sprites.hero.unkeyed) {
+                applyFighterFilter(UI.hero.canvas, 0, '',
+                    [this.sprites.hero.rig.head, this.sprites.hero.rig.arm], true);
+            }
+        }).catch(err => console.error('Sprite load failed:', err));
         this.bindEvents();
         this.ui.showStartScreen();
     }
@@ -2036,6 +2293,7 @@ class GameController {
         this.anim.releaseGuard(hSprite);
         UI.hero.canvas.classList.remove('ko-hero', 'hurt-state', 'low-hp',
             'flash-red', 'is-punching', 'is-kicking');
+        clearFighterStates(UI.hero.canvas);
         if (hSprite.rig.head) hSprite.rig.head.classList.remove('hidden', 'head-enraged', 'head-flash');
         if (hSprite.shadow) hSprite.shadow.classList.remove('floated');
 
@@ -2067,12 +2325,13 @@ class GameController {
         const mSprite = this.sprites.monster;
         // Clear leftover state classes/poses from the previous life.
         UI.monster.canvas.classList.remove('ko-monster', 'enraged', 'hurt-state', 'low-hp', 'blocking', 'healing', 'is-active', 'flash-red');
+        clearFighterStates(UI.monster.canvas);
         if (mSprite.rig.head) mSprite.rig.head.classList.remove('hidden', 'head-enraged');
         this.anim.releaseGuard(mSprite);
         this.ui.setMonsterInfo(monster);
         applyFighterFilter(UI.monster.canvas, monster.hue, '', [
             mSprite.rig.head, mSprite.rig.arm
-        ]);
+        ], mSprite.unkeyed);
         this.ui.setTimer(`ROUND ${this.currentMonsterIndex + 1}`);
         this.ui.addLog(`Round ${this.currentMonsterIndex + 1}: <b>${monster.name}</b> enters the arena!`, 'system-log');
         if (withEntrance) {
@@ -2185,7 +2444,7 @@ class GameController {
         // Visual states for the monster after taking damage.
         if (monster.isAlive()) {
             if (monster.maybeEnrage()) this._triggerEnrage(monster);
-            UI.monster.canvas.classList.toggle('hurt-state', monster.healthPercent <= 30);
+            setFighterClass(UI.monster.canvas, 'hurt-state', monster.healthPercent <= 30);
         }
 
         this.ui.updateHUD(hero, monster);
@@ -2226,7 +2485,7 @@ class GameController {
 
     _triggerEnrage(monster) {
         const mSprite = this.sprites.monster;
-        UI.monster.canvas.classList.add('enraged');
+        setFighterClass(UI.monster.canvas, 'enraged', true);
         const head = mSprite.rig.head;
         const arm = mSprite.rig.arm;
         if (head) head.classList.add('head-enraged');
@@ -2311,7 +2570,7 @@ class GameController {
         hero.gainMana(6);
         monster.regenStamina(14);
 
-        UI.hero.canvas.classList.toggle('hurt-state', hero.healthPercent <= 30);
+        setFighterClass(UI.hero.canvas, 'hurt-state', hero.healthPercent <= 30);
         this.ui.updateHUD(hero, monster);
         this.state = GameState.PLAYER_TURN;
         this.ui.setTurn('YOUR TURN', false, true);
@@ -2363,7 +2622,7 @@ class GameController {
         hero.restoreHealth(60);            // partial recovery between rounds
         hero.currentStamina = hero.maxStamina;
         hero.gainMana(15);
-        UI.hero.canvas.classList.remove('hurt-state', 'low-hp');
+        clearFighterStates(UI.hero.canvas);
         this.ui.addLog(`<b>LEVEL UP!</b> You are now Lv. ${hero.level}. HP, attack and resources increased.`, 'system-log');
         SoundFX.heal();
     }
@@ -2373,8 +2632,8 @@ class GameController {
         this.ui.setTurn('', false, false);
         this.ui.setTimer(win ? 'WIN!' : 'K.O.');
         this.ui.updateButtons(this.state, this.hero);
-        UI.hero.canvas.classList.remove('hurt-state', 'low-hp');
-        UI.monster.canvas.classList.remove('hurt-state', 'low-hp', 'enraged');
+        clearFighterStates(UI.hero.canvas);
+        clearFighterStates(UI.monster.canvas);
         if (this.sprites.monster.rig.head) this.sprites.monster.rig.head.classList.remove('head-enraged');
         this.anim._endHitStop();
         if (win) {
@@ -2406,7 +2665,10 @@ class GameController {
 // CombatSystem and FX rather than rebuilding any of them.
 
 const VS = Object.freeze({
-    WALK_SPEED: 215,          // px/s forward/back
+    WALK_SPEED: 215,          // px/s forward/back (top speed)
+    WALK_ACCEL: 1550,         // px/s^2 ramp-up  -> ~0.14s to full speed
+    WALK_DECEL: 2100,         // px/s^2 ramp-down -> ~0.10s to a stop
+    AIR_ACCEL: 900,           // px/s^2 while airborne (floatier than ground)
     AIR_CONTROL: 0.82,
     GRAVITY: 2200,            // px/s^2
     JUMP_VY: 780,             // px/s upward
@@ -2422,6 +2684,27 @@ const VS = Object.freeze({
     MIN_GAP_FACTOR: 0.40,     // min centre gap = 40% of a fighter's width
     MIN_GAP_PX: 150,
     HURT_FLASH_MS: 180
+});
+
+// Footwork + idle tuning (Phase 11). Kept out of VS so the frozen gameplay
+// constants above stay about balance, not cosmetics.
+const VS_MOTION = Object.freeze({
+    STEP_RATE: 10.5,          // rad/s of the walk cycle at full speed
+    STEP_BOB: 2.6,            // px the body rises at the passing pose of a step
+    STEP_SQUASH: 0.02,        // sy dip on foot plant (weight settling)
+    STEP_SWAY: 1.7,           // deg of torso/hip sway each step
+    STEP_ARM: 6.5,            // deg of front-arm counter-swing each step
+    STEP_LEAN: 2.2,           // deg forward lean while moving (weight over toes)
+    STOP_LEAN: -1.4,          // deg settle-back lean when braking
+    // Idle breathing / weight-shift (each fighter runs its own phase so the two
+    // never bob in lock-step).
+    IDLE_BREATH_W: (Math.PI * 2) / 3.3,   // chest rise/fall
+    IDLE_SWAY_W: (Math.PI * 2) / 4.6,     // slow weight shift
+    IDLE_BOB: 0.9,            // px rise at the top of a breath
+    IDLE_BREATH: 0.006,       // fractional chest scale
+    IDLE_ROT: 0.75,           // deg hips/torso shift
+    IDLE_ARM: 1.1,            // deg front-arm float
+    IDLE_HEAD: 0.7            // deg head counter-tilt
 });
 
 // Moves are MOVES-shaped (rollAttack/resolveIncoming consume the same fields)
@@ -2468,8 +2751,10 @@ function versusAttackPose(p, tMs) {
         const e = Ease.outQuad(wu ? t / wu : 1);
         return { phase: 'windup', frame: 'idle', x: lerp(0, p.windupX || 0, e),
                  y: p.dipFirst ? lerp(0, dip * 0.5, e) : 0,
-                 sx: lerp(1, p.squashX || 1, e), sy: lerp(1, p.squashY || 1, e), rot: 0,
-                 armDeg: lerp(0, armWind, e), armX: 0, impact: false };
+                 sx: lerp(1, p.squashX || 1, e), sy: lerp(1, p.squashY || 1, e),
+                 rot: lerp(0, p.windupRot || 0, e),
+                 armDeg: lerp(0, armWind, e), armX: 0,
+                 headDeg: lerp(0, -(p.head || 0) * 0.35, e), impact: false };
     }
     t -= wu;
     if (t < st) {
@@ -2479,28 +2764,31 @@ function versusAttackPose(p, tMs) {
                  x: lerp(p.windupX || 0, baseX, e),
                  y: lerp(p.dipFirst ? dip * 0.5 : 0, strikeY, e),
                  sx: lerp(p.squashX || 1, 1, e), sy: lerp(p.squashY || 1, 1, e),
-                 rot: lerp(0, p.rot || 0, e),
+                 rot: lerp(p.windupRot || 0, p.rot || 0, e),
                  armDeg: lerp(armWind, p.armStrike !== undefined ? p.armStrike : 0, e),
-                 armX: lerp(0, 2, e), impact: tr >= 0.62 };
+                 armX: lerp(0, 2, e),
+                 headDeg: lerp(-(p.head || 0) * 0.35, p.head || 0, e), impact: tr >= 0.62 };
     }
     t -= st;
     if (t < ho) {
         const e = Ease.outQuad(ho ? t / ho : 1);
         return { phase: 'hold', frame: p.frame || 'punch', x: baseX + 5 * e, y: holdY + 4 * e,
                  sx: 1, sy: 1, rot: (p.rot || 0) * (1 - 0.3 * e),
-                 armDeg: lerp(p.armStrike || 0, 0, e), armX: lerp(2, 0, e), impact: true };
+                 armDeg: lerp(p.armStrike || 0, 0, e), armX: lerp(2, 0, e),
+                 headDeg: (p.head || 0) * (1 - 0.4 * e), impact: true };
     }
     t -= ho;
     if (t < rc) {
         const e = Ease.inOutQuad(rc ? t / rc : 1);
         return { phase: 'recover', frame: 'idle', x: lerp(baseX + 5 - (p.anchor || 0), 0, e),
                  y: lerp(holdY + 4, 0, e), sx: 1, sy: 1, rot: lerp((p.rot || 0) * 0.7, 0, e),
-                 armDeg: -lerp(0, armWind * 0.8, e), armX: 0, impact: true };
+                 armDeg: -lerp(0, armWind * 0.8, e), armX: 0,
+                 headDeg: lerp((p.head || 0) * 0.6, 0, e), impact: true };
     }
     t -= rc;
     const e = Ease.outQuad(se ? t / se : 1);
     const s = Math.sin(e * Math.PI);
-    return { phase: 'settle', frame: 'idle', x: -3 * s, y: 0, sx: 1 + 0.02 * s, sy: 1 - 0.03 * s, rot: 0, armDeg: 0, armX: 0, impact: true };
+    return { phase: 'settle', frame: 'idle', x: -3 * s, y: 0, sx: 1 + 0.02 * s, sy: 1 - 0.03 * s, rot: 0, armDeg: 0, armX: 0, headDeg: 0, impact: true };
 }
 
 function versusAttackDuration(p) {
@@ -2517,13 +2805,16 @@ function versusHurtPose(react, tMs) {
             const e = step.ms ? t / step.ms : 1;
             return { x: step.x ? step.x(e) : 0, y: step.y ? step.y(e) : 0,
                      sx: step.sx ? step.sx(e) : 1, sy: step.sy ? step.sy(e) : 1,
-                     rot: step.r ? step.r(e) : 0, headDeg: react.headDeg || 0 };
+                     rot: step.r ? step.r(e) : 0,
+                     headDeg: step.head ? step.head(e) : (react.headDeg || 0),
+                     armDeg: step.arm ? step.arm(e) : (react.armDeg || 0) };
         }
         t -= step.ms;
     }
     const dur = react.recoverMs || 120;
     const e = Ease.outQuad(dur ? Math.min(1, t / dur) : 1);
-    return { x: lerp(0, react.restX || 0, e), y: 0, sx: 1, sy: 1, rot: lerp(0, react.restR || 0, e), headDeg: react.headDeg || 0 };
+    return { x: lerp(0, react.restX || 0, e), y: 0, sx: 1, sy: 1, rot: lerp(0, react.restR || 0, e),
+             headDeg: lerp(react.headDeg || 0, 0, e), armDeg: lerp(react.armDeg || 0, 0, e) };
 }
 
 function versusHurtDuration(react) {
@@ -2565,16 +2856,22 @@ class VersusFighter {
     reset() {
         this.forward = 0;
         this.y = 0; this.vy = 0; this.onGround = true;
+        this.speed = 0;                 // smoothed ground/air velocity along facing
         this.state = 'idle';
         this.attack = null; this.attackCd = 0;
         this.dodgeT = 0; this.dodgeCd = 0; this.iFrames = 0;
         this.hurt = null; this.hurtT = 0; this.hurtDur = 0;
         this.flashT = 0; this.walkPhase = 0;
+        // Independent idle phases so the two fighters never breathe/sway in sync.
+        this.animT = 0;
+        this.idlePhase = this.player === 1 ? 0 : 2.2;
+        this.swayPhase = this.player === 1 ? 1.1 : 3.4;
         this.input = { left: false, right: false, crouch: false, block: false };
         this._pose = null; this._frame = null; this._headKey = ''; this._armKey = '';
         const c = this.sprite.canvas;
         c.classList.remove('is-punching', 'is-kicking', 'is-active', 'flash-red',
             'hurt-state', 'blocking', 'low-hp', 'ko-hero', 'ko-monster');
+        clearFighterStates(c);
         this.setBusy(false);
         this.sprite.resetPose();
         this.sprite.resetRig();
@@ -2622,6 +2919,7 @@ class VersusFighter {
         this.dodgeCd = VS.DODGE_COOLDOWN_MS / 1000; this.iFrames = VS.DODGE_IFRAME_MS / 1000;
         this.setBusy(true);
         SoundFX.dodge();
+        this.arena.footDust(this);   // push-off dust as the feet slip back
     }
 
     tryAttack(action) {
@@ -2647,6 +2945,11 @@ class VersusFighter {
         if (this.iFrames > 0) this.iFrames -= dt;
         if (this.flashT > 0) { this.flashT -= dt; if (this.flashT <= 0) this.sprite.canvas.classList.remove('flash-red'); }
         if (this.state !== 'ko') this.char.regenStamina(VS.STAMINA_REGEN * dt);
+        this.animT = (this.animT + dt) % 1000;
+
+        // Attacks / reactions / dodges are planted: bleed any carried speed so
+        // footwork resumes cleanly from a standstill.
+        if (this.state === 'attack' || this.state === 'hurt' || this.state === 'dodge') this.speed = 0;
 
         if (this.state === 'ko') { this._pose = null; return; }
 
@@ -2691,31 +2994,66 @@ class VersusFighter {
         this._pose = this.groundPose();
     }
 
+    // Smooth, acceleration-based footwork. Speed ramps toward the input target
+    // (quick on the ground, floatier in the air) and the step cycle advances in
+    // proportion to actual travel speed — so the feet quicken with the stride
+    // and park when the fighter stops, instead of cycling in place.
     applyGroundMove(dt, airborne) {
         const dir = (this.input.right ? 1 : 0) - (this.input.left ? 1 : 0);
-        if (dir !== 0 && this.state !== 'crouch' && this.state !== 'block') {
-            const spd = VS.WALK_SPEED * (airborne ? VS.AIR_CONTROL : 1);
-            this.forward += dir * this.dirSign * spd * dt;
-            this.walkPhase += dt * 11;
-            // Only resume the idle stance on the ground; mid-air the jump pose
-            // stays paused so the body does not double-bob while airborne.
-            if (!airborne) { this.state = 'walk'; this.setBusy(false); }
-        } else if (!airborne && this.state === 'walk') {
-            this.state = 'idle';
+        const canMove = dir !== 0 && this.state !== 'crouch' && this.state !== 'block';
+        const maxSpd = VS.WALK_SPEED * (airborne ? VS.AIR_CONTROL : 1);
+        const target = canMove ? dir * this.dirSign * maxSpd : 0;
+        const accel = airborne ? VS.AIR_ACCEL : (canMove ? VS.WALK_ACCEL : VS.WALK_DECEL);
+        const dv = target - this.speed;
+        const stepMax = accel * dt;
+        this.speed += Math.max(-stepMax, Math.min(stepMax, dv));
+        if (Math.abs(this.speed) < 0.5) this.speed = 0;
+        this.forward += this.speed * dt;
+        const ratio = Math.min(1, Math.abs(this.speed) / VS.WALK_SPEED);
+        this.walkPhase += dt * VS_MOTION.STEP_RATE * ratio;
+        if (!airborne) {
+            if (ratio > 0.02) { this.state = 'walk'; this.setBusy(false); }
+            else if (this.state === 'walk') this.state = 'idle';
         }
     }
 
+    // Body pose for every grounded (or airborne) non-attack state. Footwork and
+    // idle are both scaled by how fast the fighter is actually moving, so the
+    // pose eases in/out with the speed instead of snapping between states.
     groundPose() {
-        const s = Math.sin(this.walkPhase);
         let x = 0, y = 0, sx = 1, sy = 1, rot = 0, armDeg = 0, armX = 0, headDeg = 0;
-        if (this.state === 'walk') {
-            y = -Math.abs(s) * 3;
-            rot = this.dirSign * s * 1.2;
-            armDeg = this.dirSign * s * 4;
-        } else if (this.state === 'crouch') {
-            sy = 0.90; sx = 1.03; y = 6;
+        const ratio = Math.min(1, Math.abs(this.speed || 0) / VS.WALK_SPEED);
+        const M = VS_MOTION;
+
+        if (this.state === 'crouch') {
+            sy = 0.90; sx = 1.03; y = 6; rot = this.dirSign * 0.6; headDeg = 4;
         } else if (this.state === 'block') {
-            armDeg = -42; armX = -6; rot = this.dirSign * -3;
+            armDeg = -42; armX = -6; rot = this.dirSign * -3; sy = 0.99; headDeg = -2;
+        } else if (!this.onGround) {
+            // Airborne: a small tuck + forward lean reads as weight carried up.
+            sy = 0.985; sx = 1.008; rot = this.dirSign * 2.5;
+        } else if (ratio > 0.02) {
+            // Footwork: two steps per cycle. The body rises at the passing pose
+            // and settles on each foot plant; hips lean over the driving foot.
+            const s = Math.sin(this.walkPhase);
+            const plant = 0.5 - 0.5 * Math.cos(this.walkPhase * 2);   // 0 pass .. 1 contact
+            y = -M.STEP_BOB * ratio * (1 - plant);
+            sy = 1 - M.STEP_SQUASH * ratio * plant;
+            const lean = (this.speed * this.dirSign >= 0 ? ratio : -ratio) || 0;
+            rot = this.dirSign * (s * M.STEP_SWAY * ratio) + this.dirSign * lean * M.STEP_LEAN;
+            armDeg = this.dirSign * s * M.STEP_ARM * ratio;
+        } else {
+            // Idle: breathing chest + slow weight shift, all phase-offset per
+            // fighter so hero and monster never bob identically.
+            const b = Math.sin(this.animT * M.IDLE_BREATH_W + this.idlePhase);
+            const w = Math.sin(this.animT * M.IDLE_SWAY_W + this.swayPhase);
+            const rise = 0.5 - 0.5 * Math.cos(this.animT * M.IDLE_BREATH_W + this.idlePhase);
+            y = -M.IDLE_BOB * rise;
+            sy = 1 - M.IDLE_BREATH * b;
+            sx = 1 + M.IDLE_BREATH * 0.6 * b;
+            rot = this.dirSign * M.IDLE_ROT * w;
+            armDeg = this.dirSign * M.IDLE_ARM * w;
+            headDeg = -this.dirSign * M.IDLE_HEAD * w;
         }
         this.sprite.canvas.classList.toggle('blocking', this.state === 'block');
         return { frame: 'idle', x, y, sx, sy, rot, armDeg, armX, headDeg };
@@ -2726,7 +3064,7 @@ class VersusFighter {
         a.t += dt;
         const pose = versusAttackPose(a.profile, a.t * 1000);
         if (!pose) { this.endAttack(); return; }
-        this._pose = { frame: pose.frame, x: pose.x, y: pose.y, sx: pose.sx, sy: pose.sy, rot: pose.rot, armDeg: pose.armDeg, armX: pose.armX, headDeg: 0 };
+        this._pose = { frame: pose.frame, x: pose.x, y: pose.y, sx: pose.sx, sy: pose.sy, rot: pose.rot, armDeg: pose.armDeg, armX: pose.armX, headDeg: pose.headDeg || 0 };
         if (pose.impact && !a.hitDone) { a.hitDone = true; a.impactPending = true; }
     }
 
@@ -2751,7 +3089,7 @@ class VersusFighter {
         this.attack = null;
         this.input.crouch = this.input.block = false;
         this.sprite.canvas.classList.remove('is-punching', 'is-kicking', 'is-active', 'blocking');
-        this.sprite.canvas.classList.add('hurt-state');
+        setFighterClass(this.sprite.canvas, 'hurt-state', true);
         this.setBusy(true);
     }
 
@@ -2763,13 +3101,13 @@ class VersusFighter {
 
     _applyHurtPose() {
         const p = versusHurtPose(this.hurt, this.hurtT * 1000);
-        if (p) this._pose = { frame: 'idle', x: p.x, y: p.y, sx: p.sx, sy: p.sy, rot: p.rot, armDeg: 0, armX: 0, headDeg: p.headDeg };
+        if (p) this._pose = { frame: 'idle', x: p.x, y: p.y, sx: p.sx, sy: p.sy, rot: p.rot, armDeg: p.armDeg || 0, armX: 0, headDeg: p.headDeg || 0 };
     }
 
     endHurt() {
         this.hurt = null;
         this.state = 'idle';
-        this.sprite.canvas.classList.remove('hurt-state');
+        setFighterClass(this.sprite.canvas, 'hurt-state', false);
         this.setBusy(false);
         this._pose = this.groundPose();
     }
@@ -2798,10 +3136,6 @@ class VersusFighter {
             if (frame !== 'kick') sprite.setRigPart('arm', { deg: pose.armDeg || 0, x: pose.armX || 0 });
         }
         sprite.setPose(this.forward + (pose.x || 0), -this.y + (pose.y || 0), pose.sx || 1, pose.sy || 1, pose.rot || 0);
-        if (sprite.shadow) {
-            const shift = this.player === 1 ? this.forward : -this.forward;
-            sprite.shadow.style.setProperty('transform', `translateX(${shift}px)`);
-        }
     }
 }
 
@@ -2850,8 +3184,8 @@ class VersusArena {
         this.p2 = new VersusFighter({ player: 2, name: 'PLAYER 2', char: new Character('Player 2', 220, 20), sprite: this.sprites.monster, arena: this });
         this.p1.reset(); this.p2.reset();
         this.layout();
-        applyFighterFilter(this.sprites.hero.canvas, 0, '', [this.sprites.hero.rig.head, this.sprites.hero.rig.arm]);
-        applyFighterFilter(this.sprites.monster.canvas, 190, '', [this.sprites.monster.rig.head, this.sprites.monster.rig.arm]);
+        applyFighterFilter(this.sprites.hero.canvas, 0, '', [this.sprites.hero.rig.head, this.sprites.hero.rig.arm], this.sprites.hero.unkeyed);
+        applyFighterFilter(this.sprites.monster.canvas, 190, '', [this.sprites.monster.rig.head, this.sprites.monster.rig.arm], this.sprites.monster.unkeyed);
         this._updateHUD(true, 0);
         this.p1.render(); this.p2.render();
         await sleep(650);
@@ -2902,6 +3236,14 @@ class VersusArena {
     landDust(f) {
         const p = this.anim.contactPoint(f.sprite, { x: 216, y: 360 });
         this.fx.burst(p.x, p.y, { dir: f.player === 1 ? 1 : -1, sparks: 0, dust: 6 });
+    }
+
+    // Deterministic foot-contact dust for strike plants / dodge push-offs. Uses
+    // the private-LCG spawner so added cosmetics never consume the seeded
+    // gameplay RNG (jump landings keep the original landDust() draw count).
+    footDust(f) {
+        const p = this.anim.contactPoint(f.sprite, { x: 216, y: 360 });
+        this.fx.footDust(p.x, p.y, { dir: f.player === 1 ? 1 : -1, count: 6 });
     }
 
     resolveStrike(atk, def, attack) {
@@ -2963,6 +3305,8 @@ class VersusArena {
         else if (res.isCritical) SoundFX.crit();
         else if (SoundFX[move.sound]) SoundFX[move.sound]();
         def.onHit(res);
+        // A heavy/clean blow plants the attacker's lead foot: kick up dust.
+        if (res.heavy || res.isCritical) this.footDust(atk);
         this.ui.addLog(`${atk.name} hits <b>${def.name}</b> with ${move.label} — ${dmg} damage${res.isCritical ? ' <b>CRITICAL!</b>' : ''}`, res.isCritical ? 'crit-log' : logCls(true));
     }
 
@@ -2997,7 +3341,7 @@ class VersusArena {
                 const pct = this.ui.setBar(el.healthBar, el.healthValue, hp, f.char.maxHealth);
                 el.healthBar.classList.toggle('low', pct <= 30);
                 el.healthBar.classList.toggle('critical', pct <= 25);
-                el.canvas.classList.toggle('low-hp', pct <= 25);
+                setFighterClass(el.canvas, 'low-hp', pct <= 25);
             }
             const st = Math.round(f.char.currentStamina);
             if (force || st !== this['st' + side]) {

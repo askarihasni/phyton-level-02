@@ -264,9 +264,13 @@ body {
     will-change: transform;
 }
 
-/* Enraged monster glow (also overrides the inline hue filter) */
+/* Enraged monster glow (also overrides the inline hue filter).
+   url(#chromakey) is prepended so the file:// fallback (which cannot key the
+   canvas) still removes the green screen in this state; over http:// it is a
+   no-op because the canvas is already keyed. */
 .fighter.enraged {
-    filter: drop-shadow(10px 20px 10px rgba(0,0,0,0.8))
+    filter: url(#chromakey)
+            drop-shadow(10px 20px 10px rgba(0,0,0,0.8))
             drop-shadow(0 0 14px rgba(255,40,40,0.95))
             saturate(1.5) hue-rotate(-15deg) !important;
     animation: enragePulse 0.7s ease-in-out infinite alternate;
@@ -474,7 +478,10 @@ body {
     40%, 60% { margin-left: 10px; }
 }
 
-.flash-red { filter: brightness(2) sepia(1) hue-rotate(-50deg) saturate(5) drop-shadow(10px 20px 10px rgba(0,0,0,0.8)) !important; }
+/* Hurt flash. url(#chromakey) leads the filter chain so the file:// fallback
+   (blocked canvas pixel-reads) still loses the green screen while flashing;
+   over http:// the canvas is already keyed and it is a no-op. */
+.flash-red { filter: url(#chromakey) brightness(2) sepia(1) hue-rotate(-50deg) saturate(5) drop-shadow(10px 20px 10px rgba(0,0,0,0.8)) !important; }
 
 /* =====================  CONTROLS  ===================== */
 #controls {
@@ -716,7 +723,7 @@ body {
    Deliberately animates the STANDALONE transform props (translate/rotate),
    which compose with the JS inline poses, so idle sway never fights the
    per-frame attack/stance transforms. */
-.fighter { animation: fighterStance 2.6s ease-in-out infinite; }
+.fighter { animation: fighterStance 3.2s ease-in-out infinite; }
 
 /* Face-off stance: the two sides mirror their weight-shift and run slightly
    out of phase (`--stance-dir` set per side above flips the lean; the monster
@@ -724,14 +731,18 @@ body {
    copies bobbing in lock-step. Only `animation-delay` is overridden per side —
    never the animation-name — so enrage/hurt/low-HP keep their own keyframes. */
 .fighter.hero-fighter    { animation-delay: 0s; }
-.fighter.monster-fighter { animation-delay: -0.9s; }
+.fighter.monster-fighter { animation-delay: -1.15s; }
 
+/* Idle: a calm breath (chest scale about the planted feet) layered over a
+   gentle left/right weight-shift and micro-rotation. Scaling uses the
+   bottom-centre origin, so the feet stay welded to the deck while the chest
+   rises — no floating. */
 @keyframes fighterStance {
-    0%   { translate: 0 0;                                        rotate: 0deg; }
-    30%  { translate: calc(var(--stance-dir, 1) * 1.3px) -2px;    rotate: calc(var(--stance-dir, 1) * -0.4deg); }
-    55%  { translate: 0 -3px;                                      rotate: 0deg; }
-    80%  { translate: calc(var(--stance-dir, 1) * -1.3px) -1px;   rotate: calc(var(--stance-dir, 1) * 0.4deg); }
-    100% { translate: 0 0;                                        rotate: 0deg; }
+    0%   { translate: 0 0;                                        rotate: 0deg;                                  scale: 1 1; }
+    22%  { translate: calc(var(--stance-dir, 1) * 1.3px) -1.3px;  rotate: calc(var(--stance-dir, 1) * -0.4deg);  scale: 1.004 0.998; }
+    50%  { translate: 0 -2.3px;                                   rotate: 0deg;                                  scale: 1.012 1.006; }
+    78%  { translate: calc(var(--stance-dir, 1) * -1.3px) -1.3px; rotate: calc(var(--stance-dir, 1) * 0.4deg);   scale: 1.004 0.998; }
+    100% { translate: 0 0;                                        rotate: 0deg;                                  scale: 1 1; }
 }
 
 /* JavaScript-driven motion: nobody may fight the per-frame poses */
@@ -770,30 +781,56 @@ body {
     to   { filter: brightness(1); }
 }
 
-/* ---------- Floor shadows ---------- */
+/* ---------- Floor shadows ----------
+   Two stacked ellipses anchored to the deck (NOT to the body): a WIDE soft
+   "weight" shadow and a TIGHT dark "contact" shadow that reads as the shoes
+   meeting the floor. Both are driven by --sh-scale / --sh-op, which
+   FighterSprite.setPose() updates from the body's vertical offset, so the
+   shadow shrinks/fades/softens as the fighter rises and returns on landing.
+   Their lower half is naturally hidden by the deck panel, like a shadow cast
+   against a floor edge. */
 .fighter-shadow {
     position: absolute;
-    /* Ellipse centred on the feet line (= deck top): its lower half is
-       naturally hidden by the deck panel, like a shadow against a floor edge. */
     bottom: calc(var(--deck-h, 196px) - 17px);
     height: 34px;
     width: var(--fh, 400px);   /* mirrors the fighter canvas so it stays centred */
     z-index: 1;
     display: flex;
     justify-content: center;
+    align-items: flex-end;
     pointer-events: none;
+    --sh-scale: 1;             /* horizontal spread (jump shrinks, crouch widens) */
+    --sh-op: 1;                /* opacity (jump fades out) */
+    --sh-x: 0px;               /* horizontal follow of the body (lunges / footwork) */
+    transform: translateX(var(--sh-x));
 }
 .fighter-shadow.hero-shadow { left: 5%; }
 .fighter-shadow.monster-shadow { right: 5%; }
+/* Wide body-weight shadow */
 .fighter-shadow .shadow-ellipse {
     width: 212px;
     height: 100%;
     border-radius: 50%;
     background: radial-gradient(ellipse at center, rgba(0,0,0,0.5), rgba(0,0,0,0.12) 55%, transparent 72%);
-    filter: blur(1px);
+    filter: blur(2px);
+    transform: scaleX(var(--sh-scale));
+    opacity: var(--sh-op);
 }
-/* While the fighter is airborne (KO stagger) the shadow shivers */
-.fighter-shadow.floated .shadow-ellipse { animation: shadowPulse 0.5s ease-out infinite alternate; }
+/* Tight contact shadow right under the shoes */
+.fighter-shadow .shadow-contact {
+    position: absolute;
+    bottom: 8px;
+    width: 132px;
+    height: 16px;
+    border-radius: 50%;
+    background: radial-gradient(ellipse at center, rgba(0,0,0,0.74), rgba(0,0,0,0.30) 58%, transparent 82%);
+    filter: blur(1.3px);
+    transform: scaleX(var(--sh-scale));
+    opacity: var(--sh-op);
+}
+/* While the fighter is airborne without a driven pose (KO stagger) it shivers */
+.fighter-shadow.floated .shadow-ellipse,
+.fighter-shadow.floated .shadow-contact { animation: shadowPulse 0.5s ease-out infinite alternate; }
 @keyframes shadowPulse {
     from { transform: scaleX(1); opacity: 0.9; }
     to   { transform: scaleX(0.62); opacity: 0.35; }
@@ -928,6 +965,7 @@ body {
 @media (max-width: 820px), (max-height: 640px) {
     .fighter-shadow { height: 26px; bottom: calc(var(--deck-h, 160px) - 13px); }
     .fighter-shadow .shadow-ellipse { width: 150px; }
+    .fighter-shadow .shadow-contact { width: 94px; height: 12px; bottom: 6px; }
     .round-banner { font-size: 3.4rem; }
     .damage-number.heavy-num { font-size: 0.95rem; }
     .arena-lighting {
@@ -1037,6 +1075,10 @@ body {
 #game-container.versus-mode .mana-bar-container { display: none; }
 #game-container.versus-mode .fighter { transition: none !important; }
 #game-container.versus-mode .fighter.vs-busy { animation: none; }
+/* Versus is fully delta-time/JS driven (independent per fighter), so the shared
+   CSS idle stance is switched off there. Hurt/low-HP keep their keyframes when
+   the fighter is not busy. */
+#game-container.versus-mode .fighter:not(.low-hp):not(.hurt-state) { animation-name: none; }
 #game-container.versus-mode #turn-indicator { display: none; }
 
 /* Optional 2-player input trace (off unless ?vsdebug / setDebug(true)) */
@@ -1068,4 +1110,16 @@ body {
 }
 @media (max-width: 520px) {
     .vc-grid { grid-template-columns: repeat(3, auto); }
+}
+
+/* Accessibility: respect the OS "reduce motion" preference. The idle stance is
+   slowed and shrunk to a near-still breath, and looping cosmetic motion (shadow
+   shiver, low-HP wobble) is switched off. Gameplay-critical motion (attacks,
+   hits, jumps) is unaffected. */
+@media (prefers-reduced-motion: reduce) {
+    .fighter { animation-duration: 6.4s; }
+    .fighter.low-hp { animation: none; }
+    .fighter-shadow.floated .shadow-ellipse,
+    .fighter-shadow.floated .shadow-contact { animation: none; }
+    .fighter.enraged { animation: none; }
 }

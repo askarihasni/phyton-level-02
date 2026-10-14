@@ -34,10 +34,13 @@ exactly as in production.
 
 > **Use a local server for full visuals.** Browsers block JavaScript from reading
 > the pixels of `file://` images (a security rule), which is required to remove
-> the green screen behind the fighter art. Served over `http://`, sprites are
-> keyed perfectly. Opened directly from `file://` the game still runs, but the
-> fighters keep their green backing and the articulated head/arm rig is
-> disabled. This is a browser restriction, not a bug.
+> the green screen *and* the baked floor shadow under the fighter art. Served
+> over `http://`, sprites are keyed perfectly and the floor is gone. Opened
+> directly from `file://` the game still runs: an SVG chroma-key fallback strips
+> the green screen and the articulated head/arm rig is disabled, but the baked
+> grey floor panel (and the pink cast a hue-shifted fighter gives it) can remain.
+> This is a browser restriction, not a bug — use the local server for the
+> intended look.
 
 > The repository root also contains a tiny `index.html` that redirects to
 > `rpg-arena/index.html` if you serve from the parent folder instead.
@@ -132,6 +135,13 @@ fighter gets stuck. There is no turn order and no global hit-stop in this mode.
 * **Live stance** — while idle the fighters keep a subtle, mirrored, out-of-phase
   fight-stance bob with forward/back footwork (CSS `fighterStance`), so they read
   as opponents squaring up instead of copies.
+* **Grounded** — each fighter casts two floor shadows: a wide, soft weight
+  shadow and a tight, dark contact shadow under the shoes. They stay anchored to
+  the deck (never travel with the body) and react to height: they shrink, fade
+  and soften as the fighter leaves the floor (leaping kicks, jumps, KO stagger)
+  and spread back to full on landing; a crouch widens them slightly. Heavy
+  strikes and dodges kick up a small, restrained puff of floor dust at the feet,
+  and jumps/landings do too — never a constant footstep cloud.
 
 ---
 
@@ -144,6 +154,7 @@ run from there:
 ```powershell
 cd ..
 node test-logic.js                 # core classes / moves / AI logic
+node test-transparency.js          # green-screen key + baked-floor removal
 node test-wiring.js                # HTML ids, data-move keys, assets, CSS classes
 node test-versus.js                # 2-player versus engine (pure logic, mock sprites)
 node test-versus-input.js          # 2-player input: per-key isolation + ownership
@@ -157,6 +168,7 @@ Expected baseline:
 | Suite | Result |
 |-------|--------|
 | `test-logic.js` | 56 / 56 |
+| `test-transparency.js` | 35 / 35 |
 | `test-wiring.js` | 10 / 10 |
 | `test-versus.js` | 122 / 122 |
 | `test-versus-input.js` | 163 / 163 |

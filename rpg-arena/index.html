@@ -10,6 +10,20 @@
     <link href="https://fonts.googleapis.com/css2?family=Bangers&family=Press+Start+2P&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
 </head>
 <body>
+    <!-- Chroma-key fallback (used only when the canvas pixel-read is blocked,
+         i.e. opening index.html from file://). It keys the flat green screen
+         to transparent so the arena shows through. Served over http:// the
+         canvas keying is used instead and this filter is never applied. -->
+    <svg width="0" height="0" aria-hidden="true" focusable="false" style="position:absolute">
+        <filter id="chromakey" color-interpolation-filters="sRGB">
+            <feColorMatrix in="SourceGraphic" type="matrix" result="ck" values="
+                1 0 0 0 0
+                0 1 0 0 0
+                0 0 1 0 0
+                1.25 -2.5 1.25 0 1.495"/>
+            <feComposite in="ck" in2="SourceGraphic" operator="in"/>
+        </filter>
+    </svg>
     <div id="game-container">
         <!-- Background -->
         <img src="assets/bg_arena.jpg" class="arena-bg" alt="Arena Background">
